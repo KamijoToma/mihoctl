@@ -6,3 +6,4 @@ mihoctl.lock
 config.yaml
 config.*.yaml
 providers/
+.claude/
