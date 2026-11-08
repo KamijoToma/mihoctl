@@ -5,6 +5,7 @@ mod script;
 mod service;
 mod settings;
 mod state;
+mod status;
 mod subscription;
 
 use anyhow::{Context, Result, bail};
@@ -43,8 +44,14 @@ enum Cmd {
     Apply,
     /// update + apply (what the scheduled job runs)
     Refresh,
+    /// Build and validate the config, then show how it differs from the installed one
+    Diff,
     /// Show core, controller, subscription and last-apply status
-    Status,
+    Status {
+        /// Machine-readable output (no subscription URLs or secret)
+        #[arg(long)]
+        json: bool,
+    },
     /// Print the zashboard URL (pre-filled with controller and secret)
     Ui {
         /// Ask the core to (re)download the dashboard first
@@ -121,7 +128,25 @@ fn run() -> Result<()> {
                 bail!("{failed} subscription(s) failed to update; kept their cached nodes");
             }
         }
-        Cmd::Status => status(&settings, &paths)?,
+        Cmd::Diff => {
+            // Shares config.candidate.yaml with apply/refresh.
+            let _lock = state::lock(&paths.lock_file)?;
+            let candidate = pipeline::build_checked(&settings, &paths)?;
+            let changed = pipeline::diff(&paths.config(), &candidate);
+            let identical = std::fs::read(paths.config()).ok() == std::fs::read(&candidate).ok();
+            std::fs::remove_file(&candidate).ok();
+            if !changed? {
+                if identical {
+                    eprintln!("no changes to {}; apply would only reload providers", paths.config().display());
+                } else {
+                    eprintln!("only the (masked) secret changed; apply would reload the core");
+                }
+            }
+        }
+        Cmd::Status { json } => {
+            let s = status::gather(&settings, &paths)?;
+            if json { status::print_json(&s)? } else { status::print_text(&s) }
+        }
         Cmd::Ui { update } => {
             let ctl = core::Controller::new(&settings.controller, &settings.secret);
             if update {
@@ -192,83 +217,4 @@ fn apply(settings: &Settings, paths: &Paths) -> Result<()> {
         Applied::Unchanged => eprintln!("config unchanged; providers refreshed"),
     }
     Ok(())
-}
-
-fn ago(t: Option<u64>) -> String {
-    let Some(t) = t else { return "never".into() };
-    let d = state::now_unix().saturating_sub(t);
-    match d {
-        0..60 => format!("{d}s ago"),
-        60..3600 => format!("{}m ago", d / 60),
-        3600..86400 => format!("{}h ago", d / 3600),
-        _ => format!("{}d ago", d / 86400),
-    }
-}
-
-fn status(settings: &Settings, paths: &Paths) -> Result<()> {
-    let ctl = core::Controller::new(&settings.controller, &settings.secret);
-    println!("settings   {}", paths.settings_file.display());
-    println!("core dir   {}", paths.core_dir.display());
-    println!(
-        "launchd    core: {}  refresh: {}",
-        if service::is_loaded_system(service::CORE_LABEL) { "loaded" } else { "not loaded" },
-        if service::is_loaded_user(service::REFRESH_LABEL) { "loaded" } else { "not loaded" },
-    );
-    match ctl.version() {
-        Ok(Some(v)) => {
-            let cfg = ctl.configs()?;
-            println!(
-                "core       mihomo {v} at {}  mode={} tun={} ipv6={} mixed-port={}",
-                settings.controller, cfg["mode"], cfg["tun"]["enable"], cfg["ipv6"], cfg["mixed-port"]
-            );
-            if let Ok(g) = ctl.proxy(&settings.health_check.group) {
-                println!("group      {} -> {}", settings.health_check.group, g["now"].as_str().unwrap_or("?"));
-            }
-        }
-        Ok(None) => println!("core       not reachable at {}", settings.controller),
-        Err(e) => println!("core       {e:#}"),
-    }
-    let st = State::load(&paths.state_file)?;
-    println!("subscriptions");
-    for sub in &settings.subscriptions {
-        let s = st.subscriptions.get(&sub.name);
-        let mut line = format!(
-            "  {:<14} {:>3} nodes  updated {}",
-            sub.name,
-            s.map_or(0, |s| s.nodes),
-            ago(s.and_then(|s| s.updated_at))
-        );
-        if let Some(info) = s.and_then(|s| s.userinfo.as_deref()) {
-            line.push_str(&format!("  [{}]", userinfo_summary(info)));
-        }
-        if let Some(err) = s.and_then(|s| s.last_error.as_deref()) {
-            line.push_str(&format!("\n                 last attempt {} failed: {err}", ago(s.and_then(|s| s.last_attempt))));
-        }
-        println!("{line}");
-    }
-    if let Some(a) = &st.last_apply {
-        println!("last apply {} {}: {}", ago(Some(a.at)), if a.ok { "ok" } else { "FAILED" }, a.message);
-    }
-    Ok(())
-}
-
-/// `upload=1; download=2; total=3; expire=4` → `used 1.2G/100G, expires 2026-12-01`.
-fn userinfo_summary(raw: &str) -> String {
-    let get = |k: &str| {
-        raw.split(';')
-            .filter_map(|kv| kv.split_once('='))
-            .find(|(key, _)| key.trim() == k)
-            .and_then(|(_, v)| v.trim().parse::<f64>().ok())
-    };
-    let gib = |b: f64| format!("{:.1}G", b / (1u64 << 30) as f64);
-    let mut parts = Vec::new();
-    if let Some(total) = get("total").filter(|t| *t > 0.0) {
-        let used = get("upload").unwrap_or(0.0) + get("download").unwrap_or(0.0);
-        parts.push(format!("used {}/{}", gib(used), gib(total)));
-    }
-    if let Some(exp) = get("expire").filter(|e| *e > 0.0) {
-        let days = (exp as i64 - state::now_unix() as i64) / 86400;
-        parts.push(format!("expires in {days}d"));
-    }
-    if parts.is_empty() { raw.to_string() } else { parts.join(", ") }
 }

@@ -109,6 +109,41 @@ pub fn build_checked(settings: &Settings, paths: &Paths) -> Result<std::path::Pa
     Ok(candidate)
 }
 
+/// Unified diff of the installed config against a candidate on stdout. Returns whether they differ.
+/// A missing installed config diffs as empty. The `secret:` line is masked on both sides, so the diff
+/// can be shown on screen or pasted without leaking the controller secret.
+pub fn diff(installed: &Path, candidate: &Path) -> Result<bool> {
+    let masked = |p: &Path| -> Result<String> {
+        let text = match fs::read_to_string(p) {
+            Ok(t) => t,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+            Err(e) => return Err(e).with_context(|| format!("reading {}", p.display())),
+        };
+        Ok(text.lines().map(|l| if l.starts_with("secret:") { "secret: <masked>\n".into() } else { format!("{l}\n") }).collect())
+    };
+    let dir = candidate.parent().context("candidate has no parent")?;
+    let (old, new) = (dir.join(".diff-installed.yaml"), dir.join(".diff-candidate.yaml"));
+    state::atomic_write(&old, masked(installed)?.as_bytes())?;
+    state::atomic_write(&new, masked(candidate)?.as_bytes())?;
+    let status = std::process::Command::new("diff")
+        .args(["-u", "-L"])
+        .arg(installed)
+        .arg("-L")
+        .arg(candidate)
+        .arg(&old)
+        .arg(&new)
+        .status()
+        .context("running diff");
+    fs::remove_file(&old).ok();
+    fs::remove_file(&new).ok();
+    let status = status?;
+    match status.code() {
+        Some(0) => Ok(false),
+        Some(1) => Ok(true),
+        _ => bail!("diff {} {} failed ({status})", installed.display(), candidate.display()),
+    }
+}
+
 pub enum Applied {
     /// Core running: hot-reloaded and health-checked.
     Reloaded { alive: usize },
@@ -199,6 +234,27 @@ mod tests {
     fn enforce_rejects_non_loopback_controller() {
         let err = enforce(&mut Map::new(), &settings("0.0.0.0:9090")).unwrap_err();
         assert!(err.to_string().contains("loopback"));
+    }
+
+    #[test]
+    fn diff_reports_changes_and_missing_installed_config() {
+        let dir = std::env::temp_dir().join(format!("mihoctl-diff-{}", std::process::id()));
+        fs::remove_dir_all(&dir).ok();
+        fs::create_dir_all(&dir).unwrap();
+        let (a, b) = (dir.join("config.yaml"), dir.join("config.candidate.yaml"));
+        fs::write(&b, "mode: rule\n").unwrap();
+        let missing = diff(&a, &b).unwrap();
+        fs::write(&a, "mode: rule\n").unwrap();
+        let same = diff(&a, &b).unwrap();
+        fs::write(&a, "mode: global\n").unwrap();
+        let changed = diff(&a, &b).unwrap();
+        fs::write(&b, "mode: global\nsecret: s3cret-new\n").unwrap();
+        fs::write(&a, "mode: global\nsecret: s3cret-old\n").unwrap();
+        let secret_only = diff(&a, &b).unwrap();
+        let leftovers: Vec<_> = fs::read_dir(&dir).unwrap().filter_map(|e| e.ok()).map(|e| e.file_name()).collect();
+        fs::remove_dir_all(&dir).ok();
+        assert_eq!((missing, same, changed, secret_only), (true, false, true, false));
+        assert_eq!(leftovers.len(), 2, "masked temp files must be removed: {leftovers:?}");
     }
 
     #[test]

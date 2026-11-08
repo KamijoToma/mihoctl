@@ -64,12 +64,15 @@ Subscriptions must return mihomo YAML when requested with `user_agent`. Placehol
 |---|---|
 | `mihoctl update [name…] [--proxy URL]` | Download subscriptions concurrently and replace each cache file that validates |
 | `mihoctl build [-o file]` | Generate the config and run it through `mihomo -t`; print it or write it to a file |
+| `mihoctl diff` | Build and validate, then print a unified diff against the installed `config.yaml` (node changes live in `providers/` and are not shown) |
 | `mihoctl apply` | Build, validate, install and hot-reload, then health-check; roll back on failure |
 | `mihoctl refresh` | `update` + `apply` (the scheduled job) |
-| `mihoctl status` | launchd state, core version/mode/TUN, per-subscription node counts, traffic/expiry, last errors |
+| `mihoctl status [--json]` | launchd state, core version/mode/TUN, per-subscription node counts, traffic/expiry, last errors. `--json` is for scripts and never includes subscription URLs or the secret |
 | `mihoctl ui [--update]` | zashboard URL pre-filled with controller and secret |
 | `mihoctl service install\|uninstall\|restart\|print` | Manage launchd units. `restart` is needed after editing `tun:` |
 
 Root steps (`service install/uninstall/restart`) run as a single `sudo` call. Set `SUDO_ASKPASS` to get a GUI password prompt.
+
+`contrib/swiftbar/mihoctl.5m.sh` is a SwiftBar/xbar menu-bar plugin built on `status --json`. It shows the selected node, warns about failed updates/applies, quota and expiry, and has menu items for refresh, diff, zashboard and logs. Install it with `ln -s "$PWD/contrib/swiftbar/mihoctl.5m.sh" <SwiftBar plugin folder>/`.
 
 Logs go to `~/Library/Logs/mihoctl/{core,refresh}.log`. State (node counts, `subscription-userinfo`, last apply) is stored in `<core_dir>/mihoctl-state.json`.
