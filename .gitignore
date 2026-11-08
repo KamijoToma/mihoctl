@@ -1,0 +1,8 @@
+target/
+.DS_Store
+mihoctl.toml
+mihoctl-state.json
+mihoctl.lock
+config.yaml
+config.*.yaml
+providers/
