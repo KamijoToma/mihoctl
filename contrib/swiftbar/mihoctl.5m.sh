@@ -61,4 +61,6 @@ echo "---"
 echo "Refresh now | bash=\"$MIHOCTL\" param1=refresh terminal=false refresh=true"
 echo "Show pending diff | bash=\"$MIHOCTL\" param1=diff terminal=true"
 echo "Open zashboard | bash=\"$SELF\" param1=open-ui terminal=false"
-echo "Open logs | bash=/usr/bin/open param1=$HOME/Library/Logs/mihoctl terminal=false"
+echo "Open refresh log | bash=/usr/bin/open param1=\"$HOME/Library/Logs/mihoctl/refresh.log\" terminal=false"
+# The core log is root-only (it may quote whatever the config points at): tail it via sudo in a terminal.
+echo "Tail core log (sudo) | bash=/usr/bin/sudo param1=/usr/bin/tail param2=-f param3=/Library/Logs/mihoctl/core.log terminal=true"
