@@ -143,9 +143,37 @@ pub fn build_checked(settings: &Settings, paths: &Paths) -> Result<std::path::Pa
     Ok(candidate)
 }
 
+/// A config with the controller secret masked and every node list (top-level `proxies`, inline
+/// provider `payload`s) reduced to node names: servers, passwords and UUIDs never reach the diff.
+fn mask_for_diff(text: &str) -> Result<String> {
+    if text.trim().is_empty() {
+        return Ok(String::new());
+    }
+    let Value::Object(mut cfg) = serde_yaml_ng::from_str::<Value>(text)? else { bail!("not a YAML mapping") };
+    let names = |nodes: &mut Value| {
+        if let Value::Array(list) = nodes {
+            for n in list.iter_mut() {
+                *n = n.get("name").and_then(Value::as_str).unwrap_or("<unnamed>").into();
+            }
+        }
+    };
+    if let Some(s) = cfg.get_mut("secret") {
+        *s = "<masked>".into();
+    }
+    if let Some(p) = cfg.get_mut("proxies") {
+        names(p);
+    }
+    for p in cfg.get_mut("proxy-providers").and_then(Value::as_object_mut).into_iter().flat_map(|m| m.values_mut()) {
+        if let Some(payload) = p.get_mut("payload") {
+            names(payload);
+        }
+    }
+    Ok(serde_yaml_ng::to_string(&Value::Object(cfg))?)
+}
+
 /// Unified diff of the installed config against a candidate on stdout. Returns whether they differ.
-/// A missing installed config diffs as empty. The `secret:` line is masked on both sides, so the diff
-/// can be shown on screen or pasted without leaking the controller secret.
+/// A missing installed config diffs as empty. Both sides go through `mask_for_diff`, so the diff
+/// can be shown on screen or pasted without leaking the controller secret or node credentials.
 pub fn diff(installed: &Path, candidate: &Path) -> Result<bool> {
     let masked = |p: &Path| -> Result<String> {
         let text = match fs::read_to_string(p) {
@@ -153,7 +181,7 @@ pub fn diff(installed: &Path, candidate: &Path) -> Result<bool> {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
             Err(e) => return Err(e).with_context(|| format!("reading {}", p.display())),
         };
-        Ok(text.lines().map(|l| if l.starts_with("secret:") { "secret: <masked>\n".into() } else { format!("{l}\n") }).collect())
+        mask_for_diff(&text).with_context(|| format!("parsing {}", p.display()))
     };
     let dir = candidate.parent().context("candidate has no parent")?;
     let (old, new) = (dir.join(".diff-installed.yaml"), dir.join(".diff-candidate.yaml"));
@@ -278,10 +306,27 @@ mod tests {
         fs::write(&b, "mode: global\nsecret: s3cret-new\n").unwrap();
         fs::write(&a, "mode: global\nsecret: s3cret-old\n").unwrap();
         let secret_only = diff(&a, &b).unwrap();
+        let node = |pw: &str| format!("proxy-providers:\n  s:\n    type: inline\n    payload:\n    - {{name: hk, type: ss, server: h.example, password: {pw}}}\n");
+        fs::write(&a, node("old-pw")).unwrap();
+        fs::write(&b, node("new-pw")).unwrap();
+        let credentials_only = diff(&a, &b).unwrap();
         let leftovers: Vec<_> = fs::read_dir(&dir).unwrap().filter_map(|e| e.ok()).map(|e| e.file_name()).collect();
         fs::remove_dir_all(&dir).ok();
-        assert_eq!((missing, same, changed, secret_only), (true, false, true, false));
+        assert_eq!((missing, same, changed, secret_only, credentials_only), (true, false, true, false, false));
         assert_eq!(leftovers.len(), 2, "masked temp files must be removed: {leftovers:?}");
+    }
+
+    #[test]
+    fn diff_masking_keeps_node_names_only() {
+        let cfg = "secret: s3cret\nproxies:\n- {name: tpl, type: ss, server: t.example, password: p1}\nproxy-providers:\n  s:\n    type: inline\n    payload:\n    - {name: hk, type: vmess, server: h.example, uuid: 0000-1111}\n    - {type: ss, password: p2}\n  r: {type: http, url: https://r.example/x}\n";
+        let out = mask_for_diff(cfg).unwrap();
+        for leak in ["s3cret", "p1", "p2", "0000-1111", "t.example", "h.example"] {
+            assert!(!out.contains(leak), "{leak} leaked:\n{out}");
+        }
+        for kept in ["secret: <masked>", "- tpl", "- hk", "- <unnamed>", "https://r.example/x"] {
+            assert!(out.contains(kept), "{kept} missing:\n{out}");
+        }
+        assert_eq!(mask_for_diff("").unwrap(), "");
     }
 
     #[test]

@@ -67,7 +67,7 @@ Subscriptions must return mihomo YAML when requested with `user_agent`. Placehol
 |---|---|
 | `mihoctl update [name…] [--proxy URL]` | Download subscriptions concurrently and replace each cache file that validates |
 | `mihoctl build [-o file]` | Generate the config and run it through `mihomo -t`; print it or write it to a file |
-| `mihoctl diff` | Build and validate, then print a unified diff against the installed `config.yaml` (node changes live in `providers/` and are not shown) |
+| `mihoctl diff` | Build and validate, then print a unified diff against the installed `config.yaml`. The secret is masked and nodes appear by name only (no servers or credentials), so the output is safe to paste |
 | `mihoctl apply` | Build, validate, install and hot-reload, then health-check; roll back on failure |
 | `mihoctl refresh` | `update` + `apply` (the scheduled job) |
 | `mihoctl status [--json]` | launchd state, core version/mode/TUN, per-subscription node counts, traffic/expiry, last errors. `--json` is for scripts and never includes subscription URLs or the secret |

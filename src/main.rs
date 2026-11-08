@@ -137,9 +137,9 @@ fn run() -> Result<()> {
             std::fs::remove_file(&candidate).ok();
             if !changed? {
                 if identical {
-                    eprintln!("no changes to {}; apply would only reload providers", paths.config().display());
+                    eprintln!("no changes to {}; apply would do nothing", paths.config().display());
                 } else {
-                    eprintln!("only the (masked) secret changed; apply would reload the core");
+                    eprintln!("only masked values changed (secret or node details); apply would reload the core");
                 }
             }
         }
