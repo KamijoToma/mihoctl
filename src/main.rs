@@ -172,7 +172,7 @@ fn run() -> Result<()> {
             }
             ServiceAction::Restart => service::restart_core()?,
             ServiceAction::Print => {
-                println!("{}", service::core_plist(&settings, &paths)?);
+                println!("{}", service::core_plist(&paths));
                 println!("{}", service::refresh_plist(&settings, &paths)?);
             }
         },
@@ -214,7 +214,7 @@ fn apply(settings: &Settings, paths: &Paths) -> Result<()> {
     match result? {
         Applied::Reloaded { alive } => eprintln!("applied and reloaded; {alive} nodes alive in {}", settings.health_check.group),
         Applied::Installed => eprintln!("installed {} (core not running)", paths.config().display()),
-        Applied::Unchanged => eprintln!("config unchanged; providers refreshed"),
+        Applied::Unchanged => eprintln!("config unchanged"),
     }
     Ok(())
 }

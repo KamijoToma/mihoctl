@@ -91,10 +91,11 @@ impl Controller {
         Ok(serde_json::from_str(&self.expect_ok("GET", "/configs", None)?)?)
     }
 
-    /// Reload the core's own config file. `force` re-applies listeners (ports); unchanged
-    /// listeners and an unchanged `tun:` block are kept, so connections survive.
-    pub fn reload(&self, path: &Path) -> Result<()> {
-        let body = serde_json::json!({ "path": path.to_string_lossy() });
+    /// Reload from config text. Sent inline because mihomo refuses a `path` outside its home,
+    /// which is root-owned while our config lives in the user's core_dir. `force` re-applies
+    /// listeners (ports); unchanged listeners and an unchanged `tun:` block are kept.
+    pub fn reload(&self, yaml: &[u8]) -> Result<()> {
+        let body = serde_json::json!({ "payload": String::from_utf8_lossy(yaml) });
         self.expect_ok("PUT", "/configs?force=true", Some(body)).map(drop)
     }
 
@@ -107,10 +108,6 @@ impl Controller {
 
     pub fn proxy(&self, name: &str) -> Result<Value> {
         Ok(serde_json::from_str(&self.expect_ok("GET", &format!("/proxies/{}", encode(name)), None)?)?)
-    }
-
-    pub fn update_provider(&self, name: &str) -> Result<()> {
-        self.expect_ok("PUT", &format!("/providers/proxies/{}", encode(name)), None).map(drop)
     }
 
     pub fn update_ui(&self) -> Result<()> {
