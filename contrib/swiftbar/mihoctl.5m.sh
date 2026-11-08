@@ -7,10 +7,13 @@
 # SwiftBar / xbar plugin. Install: symlink into the plugin folder; the `5m` in the name is the refresh interval.
 # Warns (⚠) when the core is down, the last apply failed, a subscription failed to update,
 # expires within $MIHOCTL_WARN_DAYS days (default 7) or used more than 90% of its quota.
+# The title is just ◉/⚠ by default: on a notched Mac with a full menu bar, macOS silently folds
+# away items that don't fit. MIHOCTL_TITLE=node also shows the selected node (up to 30 chars).
 
 export PATH="$HOME/.cargo/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
 MIHOCTL="${MIHOCTL:-$(command -v mihoctl)}"
 WARN_DAYS="${MIHOCTL_WARN_DAYS:-7}"
+TITLE="${MIHOCTL_TITLE:-icon}"
 SELF="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
 
 if [ -z "$MIHOCTL" ]; then
@@ -23,7 +26,7 @@ if ! json="$("$MIHOCTL" status --json 2>"$err")"; then
   echo "mihoctl ✕"; echo "---"; sed 's/|/¦/g; s/$/ | color=red/' "$err"; exit 0
 fi
 
-printf '%s' "$json" | jq -r --argjson now "$(date +%s)" --argjson warn_days "$WARN_DAYS" '
+printf '%s' "$json" | jq -r --argjson now "$(date +%s)" --argjson warn_days "$WARN_DAYS" --arg mode "$TITLE" '
   def days: if . then ((. - $now) / 86400 | floor) else null end;
   def gib: . / 1073741824 * 10 | round / 10 | tostring + "G";
   def quota_warn: .userinfo as $u | $u != null and ($u.total // 0) > 1
@@ -36,7 +39,9 @@ printf '%s' "$json" | jq -r --argjson now "$(date +%s)" --argjson warn_days "$WA
   (.core.state == "running") as $up
   | ($up and (.last_apply.ok != false) and ([.subscriptions[] | sub_warn] | any | not)) as $ok
   | (if $up then (.core.group_now // "?") else "core down" end) as $title
-  | "\(if $ok then "◉" else "⚠" end) \($title | clean) | length=30",
+  | (if $ok then "◉" else "⚠" end) as $icon
+  | if $mode == "node" then "\($icon) \($title | clean) | length=30"
+    elif $up then $icon else "\($icon) down" end,
     "---",
     (if $up then "mihomo \(.core.version | show) · \(.core.mode | show) · tun=\(.core.tun | show) · :\(.core.mixed_port | show)",
        (.core.error | select(.) | "\(clean) | color=red")
