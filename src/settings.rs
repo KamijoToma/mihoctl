@@ -112,7 +112,8 @@ fn default_health_timeout() -> u64 {
 pub struct Paths {
     pub settings_file: PathBuf,
     pub config_dir: PathBuf,
-    /// mihomo home (`-d`): config.yaml, providers/, geodata, ui/, cache.db.
+    /// User-owned workspace: config.yaml (the root core reads it via `-f`), candidates, node cache,
+    /// state, and the `-d` home for `mihomo -t` (geodata). The root core's home is separate.
     pub core_dir: PathBuf,
     pub providers_dir: PathBuf,
     pub state_file: PathBuf,
@@ -120,6 +121,17 @@ pub struct Paths {
 }
 
 impl Paths {
+    pub fn new(settings_file: PathBuf, config_dir: PathBuf, core_dir: PathBuf) -> Self {
+        Self {
+            settings_file,
+            config_dir,
+            providers_dir: core_dir.join("providers"),
+            // Next to the core dir, so two setups (e.g. a test core) never share state or locks.
+            state_file: core_dir.join("mihoctl-state.json"),
+            lock_file: core_dir.join("mihoctl.lock"),
+            core_dir,
+        }
+    }
     pub fn config(&self) -> PathBuf {
         self.core_dir.join("config.yaml")
     }
@@ -163,16 +175,7 @@ pub fn load(path: &Path) -> Result<(Settings, Paths)> {
         Some(raw) => expand(&config_dir, raw)?,
         None => home()?.join("Library/Application Support/mihoctl/core"),
     };
-    let paths = Paths {
-        settings_file: path.to_path_buf(),
-        providers_dir: core_dir.join("providers"),
-        // Next to the core dir, so two setups (e.g. a test core) never share state or locks.
-        state_file: core_dir.join("mihoctl-state.json"),
-        lock_file: core_dir.join("mihoctl.lock"),
-        config_dir,
-        core_dir,
-    };
-    Ok((settings, paths))
+    Ok((settings, Paths::new(path.to_path_buf(), config_dir, core_dir)))
 }
 
 fn validate(s: &Settings) -> Result<()> {

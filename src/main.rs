@@ -147,7 +147,7 @@ fn run() -> Result<()> {
             }
             ServiceAction::Restart => service::restart_core()?,
             ServiceAction::Print => {
-                println!("{}", service::core_plist(&settings, &paths)?);
+                println!("{}", service::core_plist(&paths));
                 println!("{}", service::refresh_plist(&settings, &paths)?);
             }
         },

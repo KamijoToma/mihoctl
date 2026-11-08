@@ -146,20 +146,35 @@ pub fn extract_proxies(body: &str, keep_ipv6: bool) -> Result<Vec<Value>> {
     Ok(real)
 }
 
-/// `proxy-providers` entries for every subscription that has a cached node file.
-pub fn providers(settings: &Settings, paths: &Paths) -> Map<String, Value> {
-    let mut out = Map::new();
+/// `inline` proxy-providers: the root core's home is root-owned, so it can't read our user-owned
+/// cache files. The node lists are kept apart from the entries and filled in after overrides run,
+/// so scripts neither pay to copy every node through QuickJS nor see node credentials.
+pub struct Providers {
+    pub entries: Map<String, Value>,
+    pub nodes: Vec<(String, Value)>,
+}
+
+/// Providers for every subscription that has a cached node file.
+pub fn providers(settings: &Settings, paths: &Paths) -> Result<Providers> {
+    let mut out = Providers { entries: Map::new(), nodes: Vec::new() };
     for sub in &settings.subscriptions {
-        if !paths.provider_file(&sub.name).exists() {
-            eprintln!("warning: {} has no cached nodes yet; run `mihoctl update`", sub.name);
-            continue;
-        }
+        let file = paths.provider_file(&sub.name);
+        let text = match std::fs::read_to_string(&file) {
+            Ok(text) => text,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                eprintln!("warning: {} has no cached nodes yet; run `mihoctl update`", sub.name);
+                continue;
+            }
+            Err(e) => return Err(e).with_context(|| format!("reading {}", file.display())),
+        };
+        let cached: Value = serde_yaml_ng::from_str(&text).with_context(|| format!("parsing {}", file.display()))?;
+        let nodes = cached.get("proxies").filter(|p| p.is_array()).with_context(|| format!("{} has no `proxies`", file.display()))?;
+        out.nodes.push((sub.name.clone(), nodes.clone()));
         let prefix = sub.prefix.clone().unwrap_or_else(|| format!("[{}] ", sub.name));
-        out.insert(
+        out.entries.insert(
             sub.name.clone(),
             json!({
-                "type": "file",
-                "path": format!("./providers/{}.yaml", sub.name),
+                "type": "inline",
                 "health-check": {
                     "enable": true,
                     "url": settings.health_check.url,
@@ -172,7 +187,7 @@ pub fn providers(settings: &Settings, paths: &Paths) -> Map<String, Value> {
             }),
         );
     }
-    out
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -214,6 +229,25 @@ mod tests {
             let err = extract_proxies(body, false).unwrap_err().to_string();
             assert!(err.contains(needle), "{body}: {err}");
         }
+    }
+
+    #[test]
+    fn providers_inline_cached_nodes() {
+        let dir = std::env::temp_dir().join(format!("mihoctl-providers-{}", std::process::id()));
+        let settings: Settings = toml::from_str(
+            "template = \"t.yaml\"\nsecret = \"s\"\n[[subscription]]\nname = \"a\"\nurl = \"https://a.example\"\n[[subscription]]\nname = \"b\"\nurl = \"https://b.example\"\n",
+        )
+        .unwrap();
+        let paths = Paths::new(dir.join("m.toml"), dir.clone(), dir.clone());
+        state::atomic_write(&paths.provider_file("a"), b"proxies:\n  - {name: hk, type: ss, server: h.example, port: 8388}\n").unwrap();
+        let got = providers(&settings, &paths);
+        std::fs::remove_dir_all(&dir).ok();
+        let got = got.unwrap();
+        assert_eq!(got.entries.keys().collect::<Vec<_>>(), ["a"], "b has no cache and is skipped");
+        assert_eq!(got.entries["a"]["type"], "inline");
+        assert!(got.entries["a"].get("path").is_none() && got.entries["a"].get("payload").is_none());
+        assert_eq!(got.entries["a"]["override"]["additional-prefix"], "[a] ");
+        assert_eq!(got.nodes, [("a".to_string(), json!([{"name": "hk", "type": "ss", "server": "h.example", "port": 8388}]))]);
     }
 
     #[test]
