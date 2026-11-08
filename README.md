@@ -55,6 +55,7 @@ url = "https://…"
 # via = "auto"      # auto: through the running core's mixed port, then direct; or "proxy" / "direct"
 # user_agent = "…"  # per-subscription override
 # prefix = "[airport] "
+# expires = false   # pay-as-you-go plan: ignore the airport's `expire`, never warn about it
 ```
 
 Whatever the template or overrides say, mihoctl itself always sets `external-controller`, `secret`, `external-ui` and `external-ui-url`. This keeps the controller on loopback with a secret.
@@ -76,6 +77,6 @@ Subscriptions must return mihomo YAML when requested with `user_agent`. Placehol
 
 Root steps (`service install/uninstall/restart`) run as a single `sudo` call. Set `SUDO_ASKPASS` to get a GUI password prompt.
 
-`contrib/swiftbar/mihoctl.5m.sh` is a SwiftBar/xbar menu-bar plugin built on `status --json`. Its title is just ◉ or ⚠, so it isn't folded away behind the notch of a full menu bar; set `MIHOCTL_TITLE=node` to also show the selected node. The menu shows the selected node, warns about failed updates/applies, quota and expiry, and has menu items for refresh, diff, zashboard and logs. Install it with `ln -s "$PWD/contrib/swiftbar/mihoctl.5m.sh" <SwiftBar plugin folder>/`.
+`contrib/swiftbar/mihoctl.5m.sh` is a SwiftBar/xbar menu-bar plugin built on `status --json`. Its title is just the mihoctl icon (an M routed through three nodes; a ! badge when something needs attention, crossed out when the core is down), so it isn't folded away behind the notch of a full menu bar. Set `MIHOCTL_TITLE=node` to also show the selected node. `contrib/swiftbar/icon.py` (Pillow) draws the icon. The menu shows the selected node, warns about failed updates/applies, quota and expiry, and has menu items for refresh, diff, zashboard and logs. Install it with `ln -s "$PWD/contrib/swiftbar/mihoctl.5m.sh" <SwiftBar plugin folder>/`.
 
 Logs go to `/Library/Logs/mihoctl/core.log` (root-only: `sudo tail -f /Library/Logs/mihoctl/core.log`) and `~/Library/Logs/mihoctl/refresh.log`. State (node counts, `subscription-userinfo`, last apply) is stored in `<core_dir>/mihoctl-state.json`.
