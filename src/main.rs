@@ -189,7 +189,7 @@ fn apply(settings: &Settings, paths: &Paths) -> Result<()> {
     match result? {
         Applied::Reloaded { alive } => eprintln!("applied and reloaded; {alive} nodes alive in {}", settings.health_check.group),
         Applied::Installed => eprintln!("installed {} (core not running)", paths.config().display()),
-        Applied::Unchanged => eprintln!("config unchanged; providers refreshed"),
+        Applied::Unchanged => eprintln!("config unchanged"),
     }
     Ok(())
 }
