@@ -65,6 +65,14 @@ pub struct Subscription {
     pub user_agent: Option<String>,
     /// Prefix added to node names (mihomo `override.additional-prefix`). Defaults to `[name] `.
     pub prefix: Option<String>,
+    /// `false` for plans that never expire (pay-as-you-go) whose airport still sends a meaningless
+    /// `expire` in `subscription-userinfo`: status drops it, so nothing warns about it.
+    #[serde(default = "yes")]
+    pub expires: bool,
+}
+
+fn yes() -> bool {
+    true
 }
 
 #[derive(Debug, Default, Deserialize, Clone, Copy, PartialEq, Eq)]

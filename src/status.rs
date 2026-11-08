@@ -83,7 +83,12 @@ pub fn gather(settings: &Settings, paths: &Paths) -> Result<Status> {
                 updated_at: s.and_then(|s| s.updated_at),
                 last_attempt: s.and_then(|s| s.last_attempt),
                 last_error: s.and_then(|s| s.last_error.clone()),
-                userinfo: s.and_then(|s| s.userinfo.as_deref()).map(parse_userinfo),
+                userinfo: s.and_then(|s| s.userinfo.as_deref()).map(parse_userinfo).map(|mut u| {
+                    if !sub.expires {
+                        u.expire = None;
+                    }
+                    u
+                }),
             }
         })
         .collect();
@@ -212,13 +217,16 @@ fn ago(t: Option<u64>) -> String {
     }
 }
 
-/// → `used 1.2G/100.0G, expires in 23d`.
+/// → `used 1.2G/100.0G, expires in 23d`. A `total` of 0 or 1 is a placeholder (pay-as-you-go
+/// plans), shown as plain usage — the same threshold the SwiftBar plugin uses.
 fn userinfo_summary(u: &Userinfo) -> String {
     let gib = |b: u64| format!("{:.1}G", b as f64 / (1u64 << 30) as f64);
     let mut parts = Vec::new();
-    if let Some(total) = u.total.filter(|t| *t > 0) {
-        let used = u.upload.unwrap_or(0).saturating_add(u.download.unwrap_or(0));
-        parts.push(format!("used {}/{}", gib(used), gib(total)));
+    let used = u.upload.unwrap_or(0).saturating_add(u.download.unwrap_or(0));
+    match u.total {
+        Some(total) if total > 1 => parts.push(format!("used {}/{}", gib(used), gib(total))),
+        _ if u.upload.is_some() || u.download.is_some() => parts.push(format!("used {}", gib(used))),
+        _ => {}
     }
     if let Some(exp) = u.expire.filter(|e| *e > 0) {
         let days = i64::try_from(exp).unwrap_or(i64::MAX).saturating_sub(state::now_unix() as i64) / 86400;
@@ -240,9 +248,36 @@ mod tests {
 
     #[test]
     fn summary_falls_back_to_raw_header() {
-        assert_eq!(userinfo_summary(&parse_userinfo("upload=0")), "upload=0");
+        assert_eq!(userinfo_summary(&parse_userinfo("plan=pro")), "plan=pro");
         let u = parse_userinfo("upload=536870912; download=536870912; total=10737418240");
         assert_eq!(userinfo_summary(&u), "used 1.0G/10.0G");
+    }
+
+    #[test]
+    fn placeholder_total_shows_plain_usage() {
+        // Pay-as-you-go airports send `total=1`; that is not a 0.0G quota.
+        let u = parse_userinfo("upload=536870912; download=536870912; total=1");
+        assert_eq!(userinfo_summary(&u), "used 1.0G");
+    }
+
+    #[test]
+    fn non_expiring_subscription_drops_expire() {
+        let dir = std::env::temp_dir().join(format!("mihoctl-status-{}", std::process::id()));
+        let paths = Paths::new(dir.join("m.toml"), dir.clone(), dir.clone());
+        let mut st = State::default();
+        for name in ["payg", "monthly"] {
+            st.subscriptions.entry(name.into()).or_default().userinfo = Some("upload=1; download=1; total=1; expire=1".into());
+        }
+        st.save(&paths.state_file).unwrap();
+        let settings: Settings = toml::from_str(
+            "template = \"t.yaml\"\nsecret = \"s\"\ncontroller = \"127.0.0.1:1\"\n[[subscription]]\nname = \"payg\"\nurl = \"https://a.example\"\nexpires = false\n[[subscription]]\nname = \"monthly\"\nurl = \"https://b.example\"\n",
+        )
+        .unwrap();
+        let subs: Vec<_> = settings.subscriptions.iter().map(|s| (s.name.clone(), s.expires)).collect();
+        let got = gather(&settings, &paths).map(|s| s.subscriptions.iter().map(|s| s.userinfo.as_ref().unwrap().expire).collect::<Vec<_>>());
+        std::fs::remove_dir_all(&dir).ok();
+        assert_eq!(subs, [("payg".to_string(), false), ("monthly".to_string(), true)]);
+        assert_eq!(got.unwrap(), [None, Some(1)]);
     }
 
     #[test]
