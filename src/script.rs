@@ -6,7 +6,7 @@
 //! unlike Verge/Party there is no silent fallback to the unmodified config.
 
 use anyhow::{Context as _, Result, anyhow, bail};
-use rquickjs::{CatchResultExt, Context, Function, Runtime, Value};
+use rquickjs::{CatchResultExt, CaughtError, Context, Function, Runtime, Value};
 use std::time::{Duration, Instant};
 
 const MEMORY_LIMIT: usize = 128 << 20;
@@ -22,6 +22,17 @@ const PRELUDE: &str = r#"
   globalThis.console = { log: make("log"), info: make("info"), warn: make("warn"), error: make("error"), debug: make("debug") };
 })();
 "#;
+
+/// QuickJS leaves a `null` exception when it runs out of memory while allocating the "out of
+/// memory" error itself; FreeBSD's jemalloc hits this every time.
+fn describe(e: CaughtError) -> String {
+    match &e {
+        CaughtError::Value(v) if v.is_null() => {
+            format!("null (most likely out of memory: the heap limit is {} MiB)", MEMORY_LIMIT >> 20)
+        }
+        _ => e.to_string(),
+    }
+}
 
 pub fn run(name: &str, source: &str, config: &serde_json::Value, timeout: Duration) -> Result<serde_json::Value> {
     let rt = Runtime::new().context("creating QuickJS runtime")?;
@@ -47,14 +58,14 @@ pub fn run(name: &str, source: &str, config: &serde_json::Value, timeout: Durati
             .catch(&ctx)
             .map_err(|_| anyhow!("script does not define a global `function main(config)`"))?;
         let arg = ctx.json_parse(input).catch(&ctx).map_err(|e| anyhow!("{e}"))?;
-        let mut ret: Value = main.call((arg, "mihoctl")).catch(&ctx).map_err(|e| anyhow!("main threw: {e}"))?;
+        let mut ret: Value = main.call((arg, "mihoctl")).catch(&ctx).map_err(|e| anyhow!("main threw: {}", describe(e)))?;
 
         if let Some(promise) = ret.as_promise().cloned() {
             while ctx.execute_pending_job() {}
             ret = promise
                 .finish::<Value>()
                 .catch(&ctx)
-                .map_err(|e| anyhow!("main rejected or never settled: {e}"))?;
+                .map_err(|e| anyhow!("main rejected or never settled: {}", describe(e)))?;
         }
         if !ret.is_object() || ret.is_array() {
             bail!("main must return the config object, got {}", ret.type_name());

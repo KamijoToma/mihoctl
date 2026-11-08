@@ -58,7 +58,7 @@ enum Cmd {
         #[arg(long)]
         update: bool,
     },
-    /// Install/remove the launchd units (core LaunchDaemon + refresh LaunchAgent)
+    /// Install/remove the service units (launchd on macOS, systemd on Linux)
     Service {
         #[command(subcommand)]
         action: ServiceAction,
@@ -71,7 +71,7 @@ enum ServiceAction {
     Uninstall,
     /// Restart the core (needed after editing `tun:`; ordinary applies keep the TUN up)
     Restart,
-    /// Print the generated plists without installing
+    /// Print the generated units without installing
     Print,
 }
 
@@ -164,16 +164,18 @@ fn run() -> Result<()> {
         Cmd::Service { action } => match action {
             ServiceAction::Install => {
                 service::install(&settings, &paths)?;
-                eprintln!("installed {} and {}", service::CORE_LABEL, service::REFRESH_LABEL);
+                eprintln!("installed {} and {}", service::CORE_NAME, service::REFRESH_NAME);
             }
             ServiceAction::Uninstall => {
                 service::uninstall()?;
-                eprintln!("removed launchd units");
+                eprintln!("removed {} units", service::MANAGER);
             }
             ServiceAction::Restart => service::restart_core()?,
             ServiceAction::Print => {
-                println!("{}", service::core_plist(&paths));
-                println!("{}", service::refresh_plist(&settings, &paths)?);
+                for (path, contents) in service::units(&settings, &paths)? {
+                    eprintln!("--- {}", path.display());
+                    println!("{contents}");
+                }
             }
         },
     }

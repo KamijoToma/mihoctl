@@ -54,7 +54,7 @@ printf '%s' "$json" | jq -r --argjson now "$(date +%s)" --argjson warn_days "$WA
      else "core \(.core.state) at \(.core.controller)\(if .core.error then ": " + (.core.error | clean) else "" end) | color=red"
      end),
     "\(.core.group | clean) → \(.core.group_now | show)",
-    "launchd core=\(.launchd.core) refresh=\(.launchd.refresh)\(if (.launchd.core and .launchd.refresh) then "" else " | color=orange" end)",
+    "\(.service.manager) core=\(.service.core) refresh=\(.service.refresh)\(if (.service.core and .service.refresh) then "" else " | color=orange" end)",
     "---",
     (.subscriptions[]
      | ([ "\(.nodes) nodes",

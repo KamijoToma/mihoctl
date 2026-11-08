@@ -12,3 +12,8 @@ serde_json = { version = "1.0.154", features = ["preserve_order"] }
 serde_yaml_ng = "0.10.0"
 toml = "1.2.1"
 ureq = { version = "3", features = ["json"] }
+
+# rquickjs-sys ships pre-generated bindings for Linux, macOS and Windows only; elsewhere they are
+# generated at build time, which needs libclang (FreeBSD: `pkg install llvm`).
+[target.'cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))'.dependencies]
+rquickjs = { version = "0.14", features = ["bindgen"] }

@@ -18,15 +18,20 @@ env:
 jobs:
   check-and-test:
     name: Check, Clippy & Test (${{ matrix.target }})
-    runs-on: macos-latest
+    runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
         include:
           - target: aarch64-apple-darwin
+            os: macos-latest
             run_tests: true
           - target: x86_64-apple-darwin
+            os: macos-latest
             run_tests: false
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            run_tests: true
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -51,3 +56,22 @@ jobs:
 
       - name: Build release binary
         run: cargo build --release --locked --target ${{ matrix.target }}
+
+  freebsd:
+    name: Check, Clippy & Test (x86_64-unknown-freebsd)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Clippy & test in a FreeBSD VM
+        uses: vmactions/freebsd-vm@v1
+        with:
+          usesh: true
+          prepare: pkg install -y rust llvm
+          run: |
+            set -e
+            export LIBCLANG_PATH="$(ls -d /usr/local/llvm*/lib | sort -V | tail -1)"
+            cargo clippy --locked --all-targets -- -D warnings
+            cargo test --locked
+            cargo build --release --locked

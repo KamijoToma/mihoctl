@@ -13,14 +13,16 @@ use std::path::PathBuf;
 pub struct Status {
     pub settings: PathBuf,
     pub core_dir: PathBuf,
-    pub launchd: Launchd,
+    pub service: Service,
     pub core: Core,
     pub subscriptions: Vec<Sub>,
     pub last_apply: Option<ApplyRecord>,
 }
 
 #[derive(Serialize)]
-pub struct Launchd {
+pub struct Service {
+    /// `launchd`, `systemd`, or `none` where mihoctl doesn't manage the core.
+    pub manager: &'static str,
     pub core: bool,
     pub refresh: bool,
 }
@@ -95,10 +97,7 @@ pub fn gather(settings: &Settings, paths: &Paths) -> Result<Status> {
     Ok(Status {
         settings: paths.settings_file.clone(),
         core_dir: paths.core_dir.clone(),
-        launchd: Launchd {
-            core: service::is_loaded_system(service::CORE_LABEL),
-            refresh: service::is_loaded_user(service::REFRESH_LABEL),
-        },
+        service: Service { manager: service::MANAGER, core: service::core_loaded(), refresh: service::refresh_loaded() },
         core: core(settings),
         subscriptions,
         last_apply: st.last_apply,
@@ -167,7 +166,7 @@ pub fn print_text(s: &Status) {
     println!("settings   {}", s.settings.display());
     println!("core dir   {}", s.core_dir.display());
     let loaded = |b: bool| if b { "loaded" } else { "not loaded" };
-    println!("launchd    core: {}  refresh: {}", loaded(s.launchd.core), loaded(s.launchd.refresh));
+    println!("{:<10} core: {}  refresh: {}", s.service.manager, loaded(s.service.core), loaded(s.service.refresh));
     match c.state {
         CoreState::Running => {
             let show = |v: Option<String>| v.unwrap_or_else(|| "?".into());

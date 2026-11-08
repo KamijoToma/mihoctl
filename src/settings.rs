@@ -84,9 +84,22 @@ pub enum Via {
     Direct,
 }
 
+#[cfg(target_os = "macos")]
 fn default_mihomo() -> String {
     "/opt/homebrew/opt/mihomo/bin/mihomo".into()
 }
+
+/// The first `mihomo` on `PATH`, made absolute so `service install` can copy it.
+#[cfg(not(target_os = "macos"))]
+fn default_mihomo() -> String {
+    std::env::var_os("PATH")
+        .iter()
+        .flat_map(std::env::split_paths)
+        .map(|dir| dir.join("mihomo"))
+        .find(|p| p.is_absolute() && p.is_file())
+        .map_or_else(|| "mihomo".into(), |p| p.to_string_lossy().into_owned())
+}
+
 fn default_controller() -> String {
     "127.0.0.1:9090".into()
 }
@@ -158,6 +171,27 @@ pub fn home() -> Result<PathBuf> {
     std::env::var_os("HOME").map(PathBuf::from).context("HOME is not set")
 }
 
+/// `$XDG_*_HOME` when set to an absolute path, else `~/<fallback>`.
+fn xdg(var: &str, fallback: &str) -> Result<PathBuf> {
+    match std::env::var_os(var).map(PathBuf::from) {
+        Some(p) if p.is_absolute() => Ok(p),
+        _ => Ok(home()?.join(fallback)),
+    }
+}
+
+/// macOS ignores `$XDG_CONFIG_HOME`: mihoctl has always looked in `~/.config` there.
+pub fn config_home() -> Result<PathBuf> {
+    if cfg!(target_os = "macos") { Ok(home()?.join(".config")) } else { xdg("XDG_CONFIG_HOME", ".config") }
+}
+
+fn default_core_dir() -> Result<PathBuf> {
+    if cfg!(target_os = "macos") {
+        Ok(home()?.join("Library/Application Support/mihoctl/core"))
+    } else {
+        Ok(xdg("XDG_DATA_HOME", ".local/share")?.join("mihoctl/core"))
+    }
+}
+
 pub fn expand(base: &Path, raw: &str) -> Result<PathBuf> {
     if let Some(rest) = raw.strip_prefix("~/") {
         return Ok(home()?.join(rest));
@@ -170,7 +204,7 @@ pub fn default_settings_file() -> Result<PathBuf> {
     if let Some(p) = std::env::var_os("MIHOCTL_CONFIG") {
         return Ok(PathBuf::from(p));
     }
-    Ok(home()?.join(".config/mihoctl/mihoctl.toml"))
+    Ok(config_home()?.join("mihoctl/mihoctl.toml"))
 }
 
 pub fn load(path: &Path) -> Result<(Settings, Paths)> {
@@ -181,7 +215,7 @@ pub fn load(path: &Path) -> Result<(Settings, Paths)> {
     let config_dir = path.parent().map(Path::to_path_buf).unwrap_or_else(|| PathBuf::from("."));
     let core_dir = match &settings.core_dir {
         Some(raw) => expand(&config_dir, raw)?,
-        None => home()?.join("Library/Application Support/mihoctl/core"),
+        None => default_core_dir()?,
     };
     Ok((settings, Paths::new(path.to_path_buf(), config_dir, core_dir)))
 }

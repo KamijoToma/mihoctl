@@ -1,6 +1,6 @@
 # mihoctl
 
-A headless manager for the [mihomo](https://github.com/MetaCubeX/mihomo) core on macOS. It replaces GUI clients (FlClash, Clash Verge) with a single settings file:
+A headless manager for the [mihomo](https://github.com/MetaCubeX/mihomo) core on macOS and Linux (FreeBSD: config pipeline only, see [Platforms](#platforms)). It replaces GUI clients (FlClash, Clash Verge) with a single settings file:
 
 - **Subscriptions are node sources only.** mihoctl keeps each subscription's `proxies` and drops its groups, rules and DNS. Each subscription becomes an `inline` proxy-provider with a name prefix (`[name] `), its nodes embedded in the generated config. Your template owns groups, rules, DNS and TUN.
 - **Overrides** run in the order of the `overrides` list, each one receiving the previous result. A directory entry expands to its `*.js`, `*.yaml` and `*.yml` files, sorted by file name: `10-a.js` runs before `99-b.js`. Directories are not searched recursively and dotfiles are skipped. Sorting is byte-wise, so zero-pad numeric prefixes (`05-`, not `5-`). Two kinds of override are supported:
@@ -8,8 +8,8 @@ A headless manager for the [mihomo](https://github.com/MetaCubeX/mihomo) core on
   - Clash Verge / Party style JS: `function main(config, profileName) { …; return config }`, sync or async. Scripts run in an embedded QuickJS with no filesystem, network, timers or process access, a 128 MiB heap, and the `script_timeout` limit.
 - **Fail closed.** A throwing script, a config rejected by `mihomo -t`, or an unreachable subscription stops the run. The last good config and node cache stay in place; nothing silently falls back to an unmodified config.
 - **Hot reload with rollback.** Each apply runs: `mihomo -t` → atomic swap → `PUT /configs?force=true` (config sent as `payload`) → a URL test of the `health_check.group` members. If no member answers, the previous config is restored and reloaded. Because the `tun:` block stays unchanged across reloads, the TUN device is not recreated.
-- **launchd.** The core runs as a root LaunchDaemon (`io.mihoctl.core`) because TUN needs root. `mihoctl refresh` runs every `refresh_interval` as a user LaunchAgent (`io.mihoctl.refresh`).
-- **Privilege split.** Nothing the root core executes or writes is user-writable, so code running as your user can't use it to get root. `service install` copies `mihomo` to `/Library/Application Support/mihoctl/bin/mihomo` (root-owned). The core's home (`-d`: cache, ui, geodata) is `/Library/Application Support/mihoctl/core`. Both run with umask 077. The core reads only `<core_dir>/config.yaml`, via `-f`. So `type: file` proxy/rule-providers are rejected at build time: use `type: inline` or `type: http`. `mihomo -t` validates with the installed copy, so validation and the core always run the same version. **Rerun `mihoctl service install` after upgrading mihomo**; until then both keep using the old copy.
+- **Service units.** The core runs as a root system service because TUN needs root: a LaunchDaemon (`io.mihoctl.core`) on macOS, `mihoctl-core.service` on Linux. `mihoctl refresh` runs every `refresh_interval` as a user job: a LaunchAgent (`io.mihoctl.refresh`) or a user timer (`mihoctl-refresh.timer`). See [Platforms](#platforms).
+- **Privilege split.** Nothing the root core executes or writes is user-writable, so code running as your user can't use it to get root. `service install` copies `mihomo` to a root-owned path (macOS: `/Library/Application Support/mihoctl/bin/mihomo`). The core's home (`-d`: cache, ui, geodata) is root-owned too (macOS: `/Library/Application Support/mihoctl/core`). Both run with umask 077. The core reads only `<core_dir>/config.yaml`, via `-f`. So `type: file` proxy/rule-providers are rejected at build time: use `type: inline` or `type: http`. `mihomo -t` validates with the installed copy, so validation and the core always run the same version. **Rerun `mihoctl service install` after upgrading mihomo**; until then both keep using the old copy.
 - **zashboard** is served by the core from its root-owned home and is reachable only on loopback, behind the controller secret.
 
 ## Install
@@ -36,8 +36,8 @@ template = "template.yaml"                       # relative to this file
 overrides = ["overrides"]                        # dir: *.js/*.yaml sorted by name; files and dirs can be mixed
 secret = "long-random-string"                    # required; controller auth
 # controller = "127.0.0.1:9090"                  # must be loopback
-# core_dir = "~/Library/Application Support/mihoctl/core"
-# mihomo = "/opt/homebrew/opt/mihomo/bin/mihomo"
+# core_dir = "~/Library/Application Support/mihoctl/core"   # Linux/FreeBSD: $XDG_DATA_HOME/mihoctl/core
+# mihomo = "/opt/homebrew/opt/mihomo/bin/mihomo"            # Linux/FreeBSD: first `mihomo` on PATH
 # user_agent = "clash.meta"                      # airports pick the response format from this
 # refresh_interval = "6h"
 # script_timeout = "5s"
@@ -71,12 +71,35 @@ Subscriptions must return mihomo YAML when requested with `user_agent`. Placehol
 | `mihoctl diff` | Build and validate, then print a unified diff against the installed `config.yaml`. The secret is masked and nodes appear by name only (no servers or credentials), so the output is safe to paste |
 | `mihoctl apply` | Build, validate, install and hot-reload, then health-check; roll back on failure |
 | `mihoctl refresh` | `update` + `apply` (the scheduled job) |
-| `mihoctl status [--json]` | launchd state, core version/mode/TUN, per-subscription node counts, traffic/expiry, last errors. `--json` is for scripts and never includes subscription URLs or the secret |
+| `mihoctl status [--json]` | service state, core version/mode/TUN, per-subscription node counts, traffic/expiry, last errors. `--json` is for scripts and never includes subscription URLs or the secret |
 | `mihoctl ui [--update]` | zashboard URL pre-filled with controller and secret |
-| `mihoctl service install\|uninstall\|restart\|print` | Manage launchd units. `restart` is needed after editing `tun:`. `uninstall` also deletes `/Library/Application Support/mihoctl` |
+| `mihoctl service install\|uninstall\|restart\|print` | Manage the launchd/systemd units. `restart` is needed after editing `tun:`. `uninstall` also deletes the root-owned binary and core home |
 
 Root steps (`service install/uninstall/restart`) run as a single `sudo` call. Set `SUDO_ASKPASS` to get a GUI password prompt.
 
 `contrib/swiftbar/mihoctl.5m.sh` is a SwiftBar/xbar menu-bar plugin built on `status --json`. Its title is just the mihoctl icon (an M routed through three nodes; a ! badge when something needs attention, crossed out when the core is down), so it isn't folded away behind the notch of a full menu bar. Set `MIHOCTL_TITLE=node` to also show the selected node. `contrib/swiftbar/icon.py` (Pillow) draws the icon. The menu shows the selected node, warns about failed updates/applies, quota and expiry, and has menu items for refresh, diff, zashboard and logs. Install it with `ln -s "$PWD/contrib/swiftbar/mihoctl.5m.sh" <SwiftBar plugin folder>/`.
 
-Logs go to `/Library/Logs/mihoctl/core.log` (root-only: `sudo tail -f /Library/Logs/mihoctl/core.log`) and `~/Library/Logs/mihoctl/refresh.log`. State (node counts, `subscription-userinfo`, last apply) is stored in `<core_dir>/mihoctl-state.json`.
+Logs go to `/Library/Logs/mihoctl/core.log` (root-only: `sudo tail -f /Library/Logs/mihoctl/core.log`) and `~/Library/Logs/mihoctl/refresh.log` on macOS; see [Platforms](#platforms) for Linux. State (node counts, `subscription-userinfo`, last apply) is stored in `<core_dir>/mihoctl-state.json`.
+
+## Platforms
+
+| | macOS | Linux | FreeBSD |
+|---|---|---|---|
+| `update` / `build` / `diff` / `apply` / `refresh` / `status` / `ui` | yes | yes | yes |
+| `service` | launchd | systemd | not supported |
+| Default settings file | `~/.config/mihoctl/mihoctl.toml` | `$XDG_CONFIG_HOME/mihoctl/mihoctl.toml` | same as Linux |
+| Default `core_dir` | `~/Library/Application Support/mihoctl/core` | `$XDG_DATA_HOME/mihoctl/core` | same as Linux |
+
+**Linux (systemd).** The privilege split matches macOS:
+
+| | Path |
+|---|---|
+| Core unit | `/etc/systemd/system/mihoctl-core.service` (root, umask 077) |
+| mihomo copy | `/usr/local/libexec/mihoctl/mihomo`, which SELinux lets systemd execute; a binary in `$HOME` it would not |
+| Core home (`-d`) | `/var/lib/mihoctl/core` |
+| Core log | `/var/log/mihoctl/core.log` (root-only, so `sudo tail -f`; not the journal, which `wheel`/`adm` members can read) |
+| Refresh | user timer `~/.config/systemd/user/mihoctl-refresh.timer`; logs: `journalctl --user -u mihoctl-refresh` |
+
+The core keeps only the capabilities it needs: `CAP_NET_ADMIN CAP_NET_RAW CAP_NET_BIND_SERVICE` for TUN, auto-route and low ports, and `CAP_DAC_READ_SEARCH CAP_SYS_PTRACE` to read your 0600 config and support `PROCESS-NAME` rules. The refresh timer only runs while you are logged in unless you run `loginctl enable-linger`.
+
+**FreeBSD.** Building needs libclang, because rquickjs generates its QuickJS bindings at build time there: `pkg install llvm`, and set `LIBCLANG_PATH=/usr/local/llvm<N>/lib` if it is not found. `mihoctl service` is not implemented. Run the core yourself, keeping the same privilege split: a root-owned copy of mihomo and a root-owned home, `mihomo -d <home> -f <core_dir>/config.yaml`, for example from an rc.d script with `daemon(8)`. Schedule `mihoctl refresh` with cron as your user. Check that your mihomo build supports TUN on FreeBSD before you rely on it.

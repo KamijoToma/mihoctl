@@ -1,53 +1,41 @@
-//! launchd units: the core as a root LaunchDaemon (TUN needs root) and the scheduled refresh
-//! as a user LaunchAgent (it only talks to the controller, so it needs no privileges).
-//!
-//! Nothing the root core executes or writes may be user-writable, or any process running as the
-//! user gets root without a password: it runs a root-owned copy of mihomo, with a root-owned `-d`
-//! home (cache.db, ui/, geodata) and root-only logs. The only user file it touches is the config,
-//! read via `-f`; that grants nothing the controller secret doesn't already, because mihomo
-//! confines file paths in a config to its home.
+//! launchd units: the core as a root LaunchDaemon and the scheduled refresh as a user LaunchAgent.
 
+use super::{GEODATA, check_installable, output, sudo_sh};
 use crate::settings::{self, Paths, Settings};
-use crate::{core, pipeline};
-use anyhow::{Context, Result, bail};
+use anyhow::{Result, bail};
 use std::fs;
-use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Command;
 
-pub const CORE_LABEL: &str = "io.mihoctl.core";
-pub const REFRESH_LABEL: &str = "io.mihoctl.refresh";
+pub const MANAGER: &str = "launchd";
+pub const CORE_NAME: &str = "io.mihoctl.core";
+pub const REFRESH_NAME: &str = "io.mihoctl.refresh";
 
 /// Root-owned install root: `bin/mihomo` and the core's `-d` home `core/`.
 const ROOT_DIR: &str = "/Library/Application Support/mihoctl";
 const CORE_LOG_DIR: &str = "/Library/Logs/mihoctl";
-/// Seeded from `core_dir` on install so the core can start where GitHub is blocked.
-const GEODATA: [&str; 6] = ["GEOSITE.dat", "geoip.metadb", "ASN.mmdb", "geosite.dat", "geoip.dat", "Country.mmdb"];
 
 fn core_plist_path() -> PathBuf {
-    PathBuf::from(format!("/Library/LaunchDaemons/{CORE_LABEL}.plist"))
+    PathBuf::from(format!("/Library/LaunchDaemons/{CORE_NAME}.plist"))
 }
 
-pub fn core_bin() -> PathBuf {
+fn core_bin() -> PathBuf {
     Path::new(ROOT_DIR).join("bin/mihomo")
 }
 
-pub fn core_home() -> PathBuf {
+fn core_home() -> PathBuf {
     Path::new(ROOT_DIR).join("core")
 }
 
-/// The binary the core actually runs: the installed copy, which lags `settings.mihomo` until the
-/// next `service install`. Validate with it so `mihomo -t` and the core never disagree.
-pub fn runtime_mihomo(settings: &Settings) -> String {
-    let bin = core_bin();
-    if bin.exists() { bin.to_string_lossy().into_owned() } else { settings.mihomo.clone() }
+pub fn installed_mihomo() -> Option<PathBuf> {
+    Some(core_bin())
 }
 
 fn refresh_plist_path() -> Result<PathBuf> {
-    Ok(settings::home()?.join(format!("Library/LaunchAgents/{REFRESH_LABEL}.plist")))
+    Ok(settings::home()?.join(format!("Library/LaunchAgents/{REFRESH_NAME}.plist")))
 }
 
-pub fn log_dir() -> Result<PathBuf> {
+fn log_dir() -> Result<PathBuf> {
     Ok(settings::home()?.join("Library/Logs/mihoctl"))
 }
 
@@ -74,17 +62,17 @@ fn plist(label: &str, args: &[String], extra: &str) -> String {
 }
 
 /// `Umask` 077: the core's files (and its log, which may quote whatever `-f` points at) stay root-only.
-pub fn core_plist(paths: &Paths) -> String {
+fn core_plist(paths: &Paths) -> String {
     let log = esc(&Path::new(CORE_LOG_DIR).join("core.log").to_string_lossy());
     let extra = format!(
         "  <key>RunAtLoad</key>\n  <true/>\n  <key>KeepAlive</key>\n  <true/>\n  <key>ProcessType</key>\n  <string>Interactive</string>\n  <key>Umask</key>\n  <integer>63</integer>\n  <key>StandardOutPath</key>\n  <string>{log}</string>\n  <key>StandardErrorPath</key>\n  <string>{log}</string>\n"
     );
     let lossy = |p: &Path| p.to_string_lossy().into_owned();
     let args = [lossy(&core_bin()), "-d".into(), lossy(&core_home()), "-f".into(), lossy(&paths.config())];
-    plist(CORE_LABEL, &args, &extra)
+    plist(CORE_NAME, &args, &extra)
 }
 
-pub fn refresh_plist(settings: &Settings, paths: &Paths) -> Result<String> {
+fn refresh_plist(settings: &Settings, paths: &Paths) -> Result<String> {
     let exe = std::env::current_exe()?.canonicalize()?;
     let secs = settings::parse_duration(&settings.refresh_interval)?.as_secs();
     let log = esc(&log_dir()?.join("refresh.log").to_string_lossy());
@@ -92,31 +80,12 @@ pub fn refresh_plist(settings: &Settings, paths: &Paths) -> Result<String> {
     let extra = format!(
         "  <key>StartInterval</key>\n  <integer>{secs}</integer>\n  <key>EnvironmentVariables</key>\n  <dict>\n    <key>MIHOCTL_CONFIG</key>\n    <string>{cfg}</string>\n  </dict>\n  <key>StandardOutPath</key>\n  <string>{log}</string>\n  <key>StandardErrorPath</key>\n  <string>{log}</string>\n"
     );
-    Ok(plist(REFRESH_LABEL, &[exe.to_string_lossy().into_owned(), "refresh".into()], &extra))
+    Ok(plist(REFRESH_NAME, &[exe.to_string_lossy().into_owned(), "refresh".into()], &extra))
 }
 
-/// Run a shell script as root in one `sudo` call (one password prompt). `$1…` are `args`; `stdin`
-/// is piped to the script (sudo reads the password from the tty, not stdin), so root-bound files
-/// never pass through a user-writable temp file. Uses `sudo -A` when `SUDO_ASKPASS` is set.
-fn sudo_sh(script: &str, args: &[&str], stdin: &str) -> Result<()> {
-    let mut cmd = Command::new("sudo");
-    if std::env::var_os("SUDO_ASKPASS").is_some() {
-        cmd.arg("-A");
-    }
-    let mut child = cmd
-        .args(["/bin/sh", "-euc", script, "mihoctl"])
-        .args(args)
-        .stdin(Stdio::piped())
-        .spawn()
-        .context("running sudo")?;
-    // Wait even if the write fails: sudo exiting early (wrong password, Ctrl-C) breaks the pipe,
-    // and its exit status is the error worth reporting.
-    let written = child.stdin.take().context("sudo stdin")?.write_all(stdin.as_bytes());
-    let status = child.wait().context("running sudo")?;
-    if !status.success() {
-        bail!("privileged step failed ({status})");
-    }
-    written.context("writing to sudo")
+/// `(install path, contents)` of every unit, for `service print`.
+pub fn units(settings: &Settings, paths: &Paths) -> Result<Vec<(PathBuf, String)>> {
+    Ok(vec![(core_plist_path(), core_plist(paths)), (refresh_plist_path()?, refresh_plist(settings, paths)?)])
 }
 
 fn launchctl(args: &[&str]) -> Result<bool> {
@@ -124,16 +93,15 @@ fn launchctl(args: &[&str]) -> Result<bool> {
 }
 
 fn uid() -> Result<String> {
-    let out = Command::new("id").arg("-u").output()?;
-    Ok(String::from_utf8(out.stdout)?.trim().to_string())
+    output("id", &["-u"])
 }
 
-pub fn is_loaded_system(label: &str) -> bool {
-    launchctl(&["print", &format!("system/{label}")]).unwrap_or(false)
+pub fn core_loaded() -> bool {
+    launchctl(&["print", &format!("system/{CORE_NAME}")]).unwrap_or(false)
 }
 
-pub fn is_loaded_user(label: &str) -> bool {
-    uid().and_then(|u| launchctl(&["print", &format!("gui/{u}/{label}")])).unwrap_or(false)
+pub fn refresh_loaded() -> bool {
+    uid().and_then(|u| launchctl(&["print", &format!("gui/{u}/{REFRESH_NAME}")])).unwrap_or(false)
 }
 
 /// Root steps of `install`: `$1` label, `$2` ROOT_DIR, `$3` log dir, `$4` user mihomo, `$5` plist
@@ -161,26 +129,12 @@ launchctl bootstrap system "$plist""#;
 
 /// Copies `settings.mihomo` into the root-owned tree, so rerun this after upgrading mihomo.
 pub fn install(settings: &Settings, paths: &Paths) -> Result<()> {
-    if !paths.config().exists() {
-        bail!("{} does not exist; run `mihoctl apply` first", paths.config().display());
-    }
-    if !Path::new(&settings.mihomo).exists() {
-        bail!("mihomo binary {} not found", settings.mihomo);
-    }
-    // The core starts straight from config.yaml: refuse one an older mihoctl built with `file`
-    // providers, or one the binary about to be installed rejects.
-    let config = paths.config();
-    let rebuild = || format!("{} predates this mihoctl or this mihomo; run `mihoctl apply` first", config.display());
-    let text = fs::read_to_string(&config).with_context(|| format!("reading {}", config.display()))?;
-    let cfg: serde_json::Map<String, serde_json::Value> =
-        serde_yaml_ng::from_str(&text).with_context(|| format!("parsing {}", config.display()))?;
-    pipeline::reject_local_files(&cfg).with_context(rebuild)?;
-    core::test_config(&settings.mihomo, &paths.core_dir, &config).with_context(rebuild)?;
+    check_installable(settings, paths)?;
     fs::create_dir_all(log_dir()?)?;
 
     let plist_path = core_plist_path().to_string_lossy().into_owned();
     let seed = paths.core_dir.to_string_lossy().into_owned();
-    let mut args = vec![CORE_LABEL, ROOT_DIR, CORE_LOG_DIR, settings.mihomo.as_str(), &plist_path, &seed];
+    let mut args = vec![CORE_NAME, ROOT_DIR, CORE_LOG_DIR, settings.mihomo.as_str(), &plist_path, &seed];
     args.extend(GEODATA);
     sudo_sh(INSTALL_SH, &args, &core_plist(paths))?;
 
@@ -188,8 +142,8 @@ pub fn install(settings: &Settings, paths: &Paths) -> Result<()> {
     fs::create_dir_all(agent.parent().unwrap())?;
     fs::write(&agent, refresh_plist(settings, paths)?)?;
     let domain = format!("gui/{}", uid()?);
-    if is_loaded_user(REFRESH_LABEL) {
-        launchctl(&["bootout", &format!("{domain}/{REFRESH_LABEL}")])?;
+    if refresh_loaded() {
+        launchctl(&["bootout", &format!("{domain}/{REFRESH_NAME}")])?;
     }
     if !launchctl(&["bootstrap", &domain, &agent.to_string_lossy()])? {
         bail!("launchctl bootstrap {domain} {} failed", agent.display());
@@ -199,8 +153,8 @@ pub fn install(settings: &Settings, paths: &Paths) -> Result<()> {
 
 pub fn uninstall() -> Result<()> {
     let agent = refresh_plist_path()?;
-    if is_loaded_user(REFRESH_LABEL) {
-        launchctl(&["bootout", &format!("gui/{}/{REFRESH_LABEL}", uid()?)])?;
+    if refresh_loaded() {
+        launchctl(&["bootout", &format!("gui/{}/{REFRESH_NAME}", uid()?)])?;
     }
     fs::remove_file(&agent).ok();
     // ROOT_DIR holds only what install put there or the core regenerates (binary, cache, ui, geodata).
@@ -208,14 +162,14 @@ pub fn uninstall() -> Result<()> {
         r#"launchctl bootout "system/$1" 2>/dev/null || true
 rm -f "$2"
 rm -rf "$3""#,
-        &[CORE_LABEL, &core_plist_path().to_string_lossy(), ROOT_DIR],
+        &[CORE_NAME, &core_plist_path().to_string_lossy(), ROOT_DIR],
         "",
     )
 }
 
 /// Restart the core process (needed after changing `tun:`; plain reloads keep the TUN).
 pub fn restart_core() -> Result<()> {
-    sudo_sh(r#"launchctl kickstart -k "system/$1""#, &[CORE_LABEL], "")
+    sudo_sh(r#"launchctl kickstart -k "system/$1""#, &[CORE_NAME], "")
 }
 
 #[cfg(test)]
