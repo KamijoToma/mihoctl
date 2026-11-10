@@ -67,6 +67,8 @@ Subscriptions must return mihomo YAML when requested with `user_agent`. Placehol
 | Command | Effect |
 |---|---|
 | `mihoctl update [name…] [--proxy URL]` | Download subscriptions concurrently and replace each cache file that validates |
+| `mihoctl history [subscription]` | List retained node-content hashes, first-seen Unix timestamps, node counts and the current marker |
+| `mihoctl restore <subscription> [version]` | Restore one subscription's retained nodes, rebuild with current settings, validate, install and, if running, reload/probe |
 | `mihoctl build [-o file]` | Generate the config and run it through `mihomo -t`; print it or write it to a file |
 | `mihoctl diff` | Build and validate, then print a unified diff against the installed `config.yaml`. The secret is masked and nodes appear by name only (no servers or credentials), so the output is safe to paste |
 | `mihoctl apply` | Build, validate, install and hot-reload, then health-check; roll back on failure |
@@ -81,11 +83,27 @@ Root steps (`service install/uninstall/restart`) run as a single `sudo` call. Se
 
 Logs go to `/Library/Logs/mihoctl/core.log` (root-only: `sudo tail -f /Library/Logs/mihoctl/core.log`) and `~/Library/Logs/mihoctl/refresh.log` on macOS; see [Platforms](#platforms) for Linux. State (node counts, `subscription-userinfo`, last apply) is stored in `<core_dir>/mihoctl-state.json`.
 
+### Node history and restore
+
+```sh
+mihoctl history airport
+mihoctl restore airport             # newest retained version different from the current cache
+mihoctl restore airport ab12cd       # full SHA-256 or unique hexadecimal prefix
+```
+
+Each subscription retains **at most five distinct node-content versions, including the current cache**, after a successful update or restore. Identity hashes the actual persisted `proxies` array as canonical JSON: object-key order, YAML formatting, comments and wrapper metadata do not matter; node order, nested array order, scalar types, credentials and protocol options do. Repeated content reuses the same version and first-seen timestamp; revisiting a version makes it recent without adding a slot. Invalid/ambiguous hashes and unknown subscriptions fail. Existing caches appear as unrecorded legacy versions until the next update/restore safely seeds them.
+
+Snapshots live under `<core_dir>/history/<subscription>/<sha256>.json` (directories `0700`, files `0600`), **contain node credentials**, and are not safe to share. The CLI lists metadata only; snapshot schema and content hashes are checked before restoring. The previous cache is durably saved before replacement; a history write failure keeps it unchanged. Pruning happens only after installation, always protecting the pre-operation recovery version on failure.
+
+Restore recovers **one subscription's nodes, not a historical whole runtime configuration**. It uses today's template, overrides, other cached providers and controller settings. Retained updates are **not guaranteed healthy snapshots**. Restore performs no subscription HTTP request or subscription DNS lookup and does not run `update`; it is not promised to be network-free: `mihomo -t` may need geodata, and a running core's group health check intentionally uses the network. Its probe covers `health_check.group`, not specifically the restored provider; a zero-alive response fails even with HTTP 200. Override console output and detailed source/controller error text are withheld during restore to avoid exposing credentials.
+
+The shared non-blocking process lock covers history/restore. Restore protects both the selected provider cache and installed config, then validates and uses payload hot reload plus the group probe. A build, validation, install, reload, probe, history-commit or state-save failure attempts cache, config, runtime (when changed), and state recovery independently and reports rollback failures. A live core requires an existing validated rollback config before changing nodes. If no core is running, success means **installed for next start, not reloaded or probed**. Failed candidate files are removed. Restore updates node counts and records `restored_at`/last-apply information without pretending to download a subscription or clearing its last download-failure diagnostics; traffic/expiry metadata remains from the last download.
+
 ## Platforms
 
 | | macOS | Linux | FreeBSD |
 |---|---|---|---|
-| `update` / `build` / `diff` / `apply` / `refresh` / `status` / `ui` | yes | yes | yes |
+| `update` / `history` / `restore` / `build` / `diff` / `apply` / `refresh` / `status` / `ui` | yes | yes | yes |
 | `service` | launchd | systemd | not supported |
 | Default settings file | `~/.config/mihoctl/mihoctl.toml` | `$XDG_CONFIG_HOME/mihoctl/mihoctl.toml` | same as Linux |
 | Default `core_dir` | `~/Library/Application Support/mihoctl/core` | `$XDG_DATA_HOME/mihoctl/core` | same as Linux |

@@ -35,6 +35,17 @@ fn describe(e: CaughtError) -> String {
 }
 
 pub fn run(name: &str, source: &str, config: &serde_json::Value, timeout: Duration) -> Result<serde_json::Value> {
+    run_with_output(name, source, config, timeout, true)
+}
+
+/// Restore must not let override console calls disclose current controller/node credentials.
+pub fn run_quiet(name: &str, source: &str, config: &serde_json::Value, timeout: Duration) -> Result<serde_json::Value> {
+    run_with_output(name, source, config, timeout, false)
+}
+
+fn run_with_output(
+    name: &str, source: &str, config: &serde_json::Value, timeout: Duration, output: bool,
+) -> Result<serde_json::Value> {
     let rt = Runtime::new().context("creating QuickJS runtime")?;
     rt.set_memory_limit(MEMORY_LIMIT);
     let deadline = Instant::now() + timeout;
@@ -45,7 +56,7 @@ pub fn run(name: &str, source: &str, config: &serde_json::Value, timeout: Durati
 
     let output: Result<String> = ctx.with(|ctx| {
         let log = Function::new(ctx.clone(), move |level: String, msg: String| {
-            eprintln!("[{script_name}] {level}: {msg}");
+            if output { eprintln!("[{script_name}] {level}: {msg}"); }
         })
         .map_err(|e| anyhow!("{e}"))?;
         ctx.globals().set("__mihoctl_log", log).map_err(|e| anyhow!("{e}"))?;

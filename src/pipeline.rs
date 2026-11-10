@@ -61,6 +61,10 @@ pub fn reject_local_files(cfg: &Map<String, Value>) -> Result<()> {
 }
 
 pub fn build(settings: &Settings, paths: &Paths) -> Result<String> {
+    build_with_output(settings, paths, true)
+}
+
+fn build_with_output(settings: &Settings, paths: &Paths, output: bool) -> Result<String> {
     let template_path = settings::expand(&paths.config_dir, &settings.template)?;
     let text = fs::read_to_string(&template_path).with_context(|| format!("reading {}", template_path.display()))?;
     let mut cfg: Map<String, Value> = match serde_yaml_ng::from_str::<Value>(&text)
@@ -82,10 +86,13 @@ pub fn build(settings: &Settings, paths: &Paths) -> Result<String> {
     for path in resolve_overrides(&paths.config_dir, &settings.overrides)? {
         let source = fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
         let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("override");
-        eprintln!("  override {}", path.display());
+        if output { eprintln!("  override {}", path.display()); }
         match path.extension().and_then(|e| e.to_str()) {
             Some("js") => {
-                cfg = match script::run(name, &source, &Value::Object(cfg), timeout)? {
+                let input = Value::Object(cfg);
+                let transformed = if output { script::run(name, &source, &input, timeout) }
+                    else { script::run_quiet(name, &source, &input, timeout) }?;
+                cfg = match transformed {
                     Value::Object(m) => m,
                     _ => unreachable!("script::run returns objects"),
                 };
@@ -136,10 +143,17 @@ pub fn resolve_overrides(base: &Path, entries: &[String]) -> Result<Vec<std::pat
 
 /// Build + `mihomo -t` into the candidate file. Returns its path.
 pub fn build_checked(settings: &Settings, paths: &Paths) -> Result<std::path::PathBuf> {
-    let yaml = build(settings, paths)?;
+    build_checked_with(settings, paths, &service::runtime_mihomo(settings), true)
+}
+
+/// Use the same selected runtime binary for restore preflight and candidate validation.
+pub(crate) fn build_checked_with(
+    settings: &Settings, paths: &Paths, mihomo: &str, output: bool,
+) -> Result<std::path::PathBuf> {
+    let yaml = if output { build(settings, paths) } else { build_with_output(settings, paths, false) }?;
     let candidate = paths.candidate();
     state::atomic_write(&candidate, yaml.as_bytes())?;
-    core::test_config(&service::runtime_mihomo(settings), &paths.core_dir, &candidate)?;
+    core::test_config(mihomo, &paths.core_dir, &candidate)?;
     Ok(candidate)
 }
 
@@ -216,14 +230,28 @@ pub enum Applied {
 
 /// Swap a validated candidate in, hot reload, health check; restore the previous config on failure.
 pub fn apply(settings: &Settings, paths: &Paths, st: &mut State, candidate: &Path) -> Result<Applied> {
+    apply_inner(settings, paths, st, candidate, None, false, || fs::File::open(&paths.core_dir)?.sync_all())
+}
+
+/// Restore has already checked and protected its rollback config before changing the node cache.
+pub fn apply_restore(
+    settings: &Settings, paths: &Paths, st: &mut State, candidate: &Path, running: bool,
+) -> Result<Applied> {
+    apply_inner(settings, paths, st, candidate, Some(running), true, || fs::File::open(&paths.core_dir)?.sync_all())
+}
+
+fn apply_inner(
+    settings: &Settings, paths: &Paths, st: &mut State, candidate: &Path, running: Option<bool>, force: bool,
+    sync_config_dir: impl FnOnce() -> std::io::Result<()>,
+) -> Result<Applied> {
     let target = paths.config();
     let new = fs::read(candidate)?;
-    let old = fs::read(&target).ok();
+    let old = if force { None } else { fs::read(&target).ok() };
     let ctl = Controller::new(&settings.controller, &settings.secret);
-    let running = ctl.version()?.is_some();
+    let running = match running { Some(running) => running, None => ctl.version()?.is_some() };
 
     // Nodes are inlined into the config, so the same text means the same nodes too.
-    if old.as_deref() == Some(new.as_slice()) {
+    if !force && old.as_deref() == Some(new.as_slice()) {
         fs::remove_file(candidate).ok();
         record(st, true, "config unchanged");
         return Ok(Applied::Unchanged);
@@ -232,25 +260,36 @@ pub fn apply(settings: &Settings, paths: &Paths, st: &mut State, candidate: &Pat
         state::atomic_write(&paths.last_good(), old)?;
     }
     fs::rename(candidate, &target)?;
-
-    if !running {
-        record(st, true, "installed (core not running)");
-        return Ok(Applied::Installed);
-    }
-
-    let outcome = ctl.reload(&new).and_then(|()| {
+    let mut reload_attempted = false;
+    let outcome = (|| -> Result<Applied> {
+        sync_config_dir()?;
+        if !running { return Ok(Applied::Installed); }
+        reload_attempted = true;
+        ctl.reload(&new)?;
         let hc = &settings.health_check;
-        ctl.group_delay(&hc.group, &hc.url, hc.timeout_ms)
-            .with_context(|| format!("health check: no member of group {:?} reached {}", hc.group, hc.url))
-    });
+        let alive = ctl.group_delay(&hc.group, &hc.url, hc.timeout_ms)
+            .with_context(|| format!("health check: probe group {:?} failed", hc.group))?;
+        if alive == 0 { bail!("health check: probe group has zero alive members"); }
+        Ok(Applied::Reloaded { alive })
+    })();
     match outcome {
-        Ok(alive) => {
-            record(st, true, &format!("reloaded; {alive} nodes alive in {}", settings.health_check.group));
-            Ok(Applied::Reloaded { alive })
+        Ok(applied) => {
+            match &applied {
+                Applied::Installed => record(st, true, "installed (core not running)"),
+                Applied::Reloaded { alive } =>
+                    record(st, true, &format!("reloaded; {alive} nodes alive in {}", settings.health_check.group)),
+                Applied::Unchanged => unreachable!("unchanged configs return before installation"),
+            }
+            Ok(applied)
         }
         Err(err) => {
+            // Restore owns the provider+config+state transaction and attempts each rollback independently.
+            if force { return Err(err); }
             let rollback = match old {
-                Some(old) => state::atomic_write(&target, &old).and_then(|()| ctl.reload(&old)),
+                Some(old) => state::atomic_write(&target, &old)
+                    .and_then(|()| if reload_attempted { ctl.reload(&old) } else { Ok(()) }),
+                None if !reload_attempted => fs::remove_file(&target)
+                    .and_then(|()| fs::File::open(&paths.core_dir)?.sync_all()).map_err(Into::into),
                 None => Ok(()),
             };
             match rollback {
@@ -271,6 +310,32 @@ mod tests {
 
     fn settings(controller: &str) -> Settings {
         toml::from_str(&format!("template = \"t.yaml\"\nsecret = \"s3cret\"\ncontroller = \"{controller}\"\n")).unwrap()
+    }
+
+    #[test]
+    fn post_rename_sync_failure_restores_previous_config_state_and_retry_installs() {
+        for had_config in [false, true] {
+            let dir = std::env::temp_dir().join(format!("mihoctl-apply-sync-{}-{had_config}", std::process::id()));
+            let paths = Paths::new(dir.join("settings.toml"), dir.clone(), dir.join("core"));
+            let settings = settings("127.0.0.1:1");
+            let old: Option<&[u8]> = if had_config { Some(b"proxies: [old]\n") } else { None };
+            if let Some(old) = old { state::atomic_write(&paths.config(), old).unwrap(); }
+            let new = b"proxies: [new]\n";
+            state::atomic_write(&paths.candidate(), new).unwrap();
+            let mut st = State::default();
+            let failed = apply_inner(&settings, &paths, &mut st, &paths.candidate(), Some(false), false,
+                || Err(std::io::Error::other("injected post-rename sync failure")));
+            let after_failure = fs::read(paths.config()).ok();
+            state::atomic_write(&paths.candidate(), new).unwrap();
+            let retry = apply_inner(&settings, &paths, &mut st, &paths.candidate(), Some(false), false,
+                || fs::File::open(&paths.core_dir)?.sync_all());
+            let installed = fs::read(paths.config()).unwrap();
+            fs::remove_dir_all(dir).unwrap();
+            assert!(failed.is_err());
+            assert_eq!(after_failure.as_deref(), old);
+            assert!(matches!(retry, Ok(Applied::Installed)));
+            assert_eq!(installed, new);
+        }
     }
 
     #[test]

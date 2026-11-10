@@ -165,6 +165,9 @@ impl Paths {
     pub fn provider_file(&self, name: &str) -> PathBuf {
         self.providers_dir.join(format!("{name}.yaml"))
     }
+    pub fn history_dir(&self, name: &str) -> PathBuf {
+        self.core_dir.join("history").join(name)
+    }
 }
 
 pub fn home() -> Result<PathBuf> {

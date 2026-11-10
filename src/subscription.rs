@@ -1,5 +1,5 @@
 //! Subscriptions are node sources only: we keep their `proxies` and drop everything else
-//! (groups, rules, DNS, inbounds). Each one becomes a `file` proxy-provider whose content we
+//! (groups, rules, DNS, inbounds). Each one becomes an inline proxy-provider whose content we
 //! download, validate and cache ourselves, so a broken or unreachable subscription never
 //! replaces the last good node list.
 
@@ -52,8 +52,9 @@ pub fn update_all(
             let entry = state.subscriptions.entry(name.clone()).or_default();
             entry.last_attempt = Some(now);
             let outcome = res.and_then(|f| {
-                let body = serde_yaml_ng::to_string(&json!({ "proxies": f.proxies }))?;
-                state::atomic_write(&paths.provider_file(&name), body.as_bytes())?;
+                let body = crate::history::provider_body(&f.proxies)?;
+                crate::history::replace(paths, &name, body.as_bytes())?;
+                entry.restored_at = None;
                 entry.updated_at = Some(now);
                 entry.nodes = f.proxies.len();
                 entry.userinfo = f.userinfo;

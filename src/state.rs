@@ -13,19 +13,24 @@ pub fn atomic_write(path: &Path, contents: &[u8]) -> Result<()> {
     let dir = path.parent().context("path has no parent")?;
     fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
     let tmp = dir.join(format!(".{}.tmp", path.file_name().and_then(|n| n.to_str()).unwrap_or("file")));
-    {
-        let mut f = fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(&tmp)
-            .with_context(|| format!("creating {}", tmp.display()))?;
-        f.set_permissions(fs::Permissions::from_mode(0o600))?;
-        f.write_all(contents)?;
-        f.sync_all()?;
-    }
-    fs::rename(&tmp, path).with_context(|| format!("replacing {}", path.display()))
+    let result = (|| -> Result<()> {
+        {
+            let mut f = fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(0o600)
+                .open(&tmp)
+                .with_context(|| format!("creating {}", tmp.display()))?;
+            f.set_permissions(fs::Permissions::from_mode(0o600))?;
+            f.write_all(contents)?;
+            f.sync_all()?;
+        }
+        fs::rename(&tmp, path).with_context(|| format!("replacing {}", path.display()))?;
+        fs::File::open(dir)?.sync_all().context("syncing containing directory")
+    })();
+    if result.is_err() { fs::remove_file(&tmp).ok(); }
+    result
 }
 
 pub fn now_unix() -> u64 {
@@ -41,13 +46,15 @@ pub struct State {
 
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct SubState {
-    /// Unix time of the last successful download that produced the cached provider file.
+    /// Unix time of the last successful download; a restore does not change download diagnostics.
     pub updated_at: Option<u64>,
     pub nodes: usize,
     /// Raw `subscription-userinfo` header (traffic and expiry), when the server sends one.
     pub userinfo: Option<String>,
     pub last_attempt: Option<u64>,
     pub last_error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub restored_at: Option<u64>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

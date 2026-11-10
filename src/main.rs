@@ -1,6 +1,8 @@
 mod core;
+mod history;
 mod merge;
 mod pipeline;
+mod restore;
 mod script;
 mod service;
 mod settings;
@@ -35,6 +37,10 @@ enum Cmd {
         #[arg(long)]
         proxy: Option<String>,
     },
+    /// List retained node versions (not historical runtime configurations)
+    History { subscription: Option<String> },
+    /// Restore one subscription's nodes using the current template and overrides
+    Restore { subscription: String, version: Option<String> },
     /// Generate and validate the config; print it, or write it to a file
     Build {
         #[arg(short, long)]
@@ -93,6 +99,25 @@ fn run() -> Result<()> {
         .with_context(|| format!("creating {}", paths.providers_dir.display()))?;
 
     match cli.cmd {
+        Cmd::History { subscription } => {
+            let _lock = state::lock(&paths.lock_file)?;
+            history::print(&settings, &paths, subscription.as_deref())?;
+        }
+        Cmd::Restore { subscription, version } => {
+            let _lock = state::lock(&paths.lock_file)?;
+            let restored = restore::run(&settings, &paths, &subscription, version.as_deref())?;
+            match restored.applied {
+                Applied::Reloaded { alive } => eprintln!(
+                    "restored nodes for {subscription} ({}); reloaded; {alive} alive in probe group {:?} (group scope, not provider health)",
+                    restored.hash, settings.health_check.group
+                ),
+                Applied::Installed => eprintln!(
+                    "restored nodes for {subscription} ({}); installed for next start (core not running; not probed)",
+                    restored.hash
+                ),
+                Applied::Unchanged => unreachable!("restore always installs and probes when running"),
+            }
+        }
         Cmd::Update { names, proxy } => {
             let _lock = state::lock(&paths.lock_file)?;
             for n in &names {
@@ -103,6 +128,8 @@ fn run() -> Result<()> {
             update(&settings, &paths, &names, proxy)?;
         }
         Cmd::Build { output } => {
+            // Build also shares the candidate with restore/apply/diff.
+            let _lock = state::lock(&paths.lock_file)?;
             let candidate = pipeline::build_checked(&settings, &paths)?;
             match output {
                 Some(out) => {
