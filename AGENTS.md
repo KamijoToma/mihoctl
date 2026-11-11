@@ -2,7 +2,7 @@
 
 ## Project Overview
 
-`mihoctl` is a headless macOS/Linux manager (FreeBSD: config pipeline only) for the [`mihomo`](https://github.com/MetaCubeX/mihomo) proxy core. It replaces GUI clients (FlClash, Clash Verge) with a deterministic, fail-closed CLI driven by a single TOML file (`~/.config/mihoctl/mihoctl.toml`):
+`mihoctl` is a headless macOS, Linux and FreeBSD manager for the [`mihomo`](https://github.com/MetaCubeX/mihomo) proxy core. It replaces GUI clients (FlClash, Clash Verge) with a deterministic, fail-closed CLI driven by a single TOML file (`~/.config/mihoctl/mihoctl.toml`):
 - **Subscriptions are node sources only**: only `proxies` are extracted, cached in `providers/<name>.yaml`, and inlined into the config as `type: inline` proxy-providers; upstream groups, rules, DNS, and inbounds are discarded.
 - **Template + ordered overrides**: a base YAML template is combined with generated `proxy-providers`, transformed through ordered YAML deep-merge files and sandboxed QuickJS scripts (`function main(config, profileName)`), and locked down by enforcing loopback controller + secret settings.
 - **Validated hot reload with rollback**: candidate configs are checked via `mihomo -t`, atomically swapped, hot-reloaded over REST (`PUT /configs?force=true` with the YAML as `payload`, without tearing down `tun:`), and probed via `GET /group/<group>/delay`; failed health checks automatically roll back to the previous config.
@@ -37,7 +37,7 @@ mihoctl.toml ──► settings::load() ──► Paths { config_dir, core_dir, 
 
 - **Read-only views**: `status` (`src/status.rs`) gathers one `Status` snapshot and renders it as text or `--json` (for scripts and `contrib/swiftbar/`); it never carries subscription URLs or the controller secret. `diff` runs `build_checked`, then `pipeline::diff` masks both sides with `mask_for_diff` (secret → `<masked>`, node credentials reduced to names) and shells out to `diff -u`.
 
-- **Privilege split (`src/service/`)**: the backend is picked by `cfg(target_os)`: `launchd.rs` (macOS), `systemd.rs` (Linux: root `mihoctl-core.service` with a root-owned `/usr/local/libexec/mihoctl/mihomo`, `/var/lib/mihoctl/core` home and `/var/log/mihoctl/core.log`, plus the user `mihoctl-refresh.timer`), `unsupported.rs` elsewhere. Shared invariants and helpers (`check_installable`, `sudo_sh`, `runtime_mihomo`) live in `mod.rs`. On macOS `io.mihoctl.core` runs `mihomo` as a root `LaunchDaemon` (`/Library/LaunchDaemons/io.mihoctl.core.plist`) because macOS TUN requires root. `io.mihoctl.refresh` runs `mihoctl refresh` as an unprivileged user `LaunchAgent` (`~/Library/LaunchAgents/io.mihoctl.refresh.plist`), communicating with the core exclusively over the loopback REST controller.
+- **Privilege split (`src/service/`)**: the backend is picked by `cfg(target_os)`: `launchd.rs` (macOS), `systemd.rs` (Linux: root `mihoctl-core.service` with a root-owned `/usr/local/libexec/mihoctl/mihomo`, `/var/lib/mihoctl/core` home and `/var/log/mihoctl/core.log`, plus the user `mihoctl-refresh.timer`), `rc.rs` (FreeBSD: root `/usr/local/etc/rc.d/mihoctl_core` running mihomo under `daemon(8) -r` with `/usr/local/libexec/mihoctl/mihomo`, `/var/db/mihoctl/core` and `/var/log/mihoctl/core.log`, plus a user crontab `@<refresh_interval>` entry), `unsupported.rs` elsewhere. Shared invariants and helpers (`check_installable`, `sudo_sh`, `runtime_mihomo`) live in `mod.rs`. On macOS `io.mihoctl.core` runs `mihomo` as a root `LaunchDaemon` (`/Library/LaunchDaemons/io.mihoctl.core.plist`) because macOS TUN requires root. `io.mihoctl.refresh` runs `mihoctl refresh` as an unprivileged user `LaunchAgent` (`~/Library/LaunchAgents/io.mihoctl.refresh.plist`), communicating with the core exclusively over the loopback REST controller.
 - **Root core never touches user-writable paths**: otherwise any process running as the user gets root without a password. `service install` copies `settings.mihomo` to root-owned `/Library/Application Support/mihoctl/bin/mihomo`; the core runs with `-d /Library/Application Support/mihoctl/core` (root-owned home: `cache.db`, `ui/`, geodata), `Umask` 077, and logs to root-only `/Library/Logs/mihoctl/core.log`. Its only user-owned input is `<core_dir>/config.yaml`, read via `-f`. Consequences: mihomo refuses `PUT /configs` with a `path` outside its home, so reloads send `payload`; config files can't reference `type: file` providers; `mihomo -t` uses `service::runtime_mihomo()` (the installed copy when present) so validation matches the running version. Never point the plist at a user-owned binary, directory or log, and never stage root-bound files in temp dirs (`sudo_sh` pipes them over stdin).
 
 ## Key Directories
@@ -49,6 +49,7 @@ mihoctl.toml ──► settings::load() ──► Paths { config_dir, core_dir, 
 - `~/Library/Application Support/mihoctl/core/` *(runtime default `core_dir`)* — user-owned workspace holding `config.yaml`, `config.candidate.yaml`, `config.last-good.yaml`, `providers/*.yaml` (node cache), `mihoctl-state.json`, `mihoctl.lock`, and geodata files for `mihomo -t`.
 - `/Library/Application Support/mihoctl/` *(root-owned, created by `service install`)* — `bin/mihomo` (the copy the core runs) and `core/` (the core's `-d` home: `cache.db`, `ui/`, geodata).
 - `/Library/Logs/mihoctl/core.log` *(root-only)* and `~/Library/Logs/mihoctl/refresh.log` — written by the launchd units.
+- `/var/db/mihoctl/` and `/usr/local/libexec/mihoctl/` *(root-owned, created by `service install` on FreeBSD)* — the core's `-d` home and the mihomo copy; root-only `/var/log/mihoctl/core.log` and user `<core_dir>/refresh.log`.
 
 ## Development Commands
 
@@ -107,13 +108,13 @@ MIHOCTL="$PWD/target/debug/mihoctl" contrib/swiftbar/mihoctl.5m.sh
 - `src/merge.rs` — Recursive YAML object merger supporting `key!`, `+key`, `key+`, and `<key>` escaping.
 - `src/script.rs` — Embedded QuickJS runtime, `console` forwarding prelude, promise draining, and sandbox limits.
 - `src/core.rs` — `mihomo -t` subprocess validator (`test_config`), REST `Controller` client (`ureq`), and RFC 3986 percent-encoder (`encode`).
-- `src/service/` — `mod.rs`: shared install checks, `runtime_mihomo`, single-invocation `sudo_sh` (stdin-fed, `SUDO_ASKPASS` aware); `launchd.rs` / `systemd.rs`: unit generators, root-owned install layout (`core_bin`, `core_home`, `INSTALL_SH`); `unsupported.rs`: fallback for other OSes.
+- `src/service/` — `mod.rs`: shared install checks, `runtime_mihomo`, single-invocation `sudo_sh` (stdin-fed, `SUDO_ASKPASS` aware); `launchd.rs` / `systemd.rs` / `rc.rs`: unit/script generators, root-owned install layout (`core_bin`, `core_home`, `INSTALL_SH`); `unsupported.rs`: fallback for other OSes.
 - `src/state.rs` — `0600` atomic file writer (`atomic_write`), `mihoctl-state.json` persistence (`State`), and advisory file lock (`lock`).
 - `contrib/swiftbar/mihoctl.5m.sh` — menu-bar plugin. In its `jq` program, `//` treats `false` like `null` (use `!= false` / `show` for booleans), and every interpolated field must go through `clean`, because SwiftBar splits each line on `|` (real node names contain it). Keep stderr out of the parsed JSON.
 
 ## Runtime/Tooling Preferences
 
-- **Toolchain & Target Platform**: stable Rust (`edition = "2024"`), targeting macOS (`aarch64-apple-darwin`, `x86_64-apple-darwin`) and Linux (`*-unknown-linux-musl` releases); FreeBSD is CI-checked and needs libclang (`pkg install llvm`) because rquickjs generates bindings there.
+- **Toolchain & Target Platform**: stable Rust (`edition = "2024"`), targeting macOS (`aarch64-apple-darwin`, `x86_64-apple-darwin`), Linux (`*-unknown-linux-musl` releases) and FreeBSD; FreeBSD is CI-checked and needs libclang (`pkg install llvm`) because rquickjs generates bindings there.
 - **Dependency Constraints (`Cargo.toml`)**:
   - Keep `serde_json` feature `"preserve_order"` enabled so YAML/JSON config keys preserve template/override insertion order.
   - Keep synchronous HTTP (`ureq`) and scoped threads; do not introduce `tokio`/`async-std` for host I/O.
@@ -122,7 +123,7 @@ MIHOCTL="$PWD/target/debug/mihoctl" contrib/swiftbar/mihoctl.5m.sh
 
 ## Testing & QA
 
-- **Framework**: standard Rust `#[cfg(test)] mod tests` colocated at the bottom of `src/subscription.rs`, `src/pipeline.rs`, `src/script.rs`, `src/merge.rs`, `src/service/{launchd,systemd}.rs` (each compiled only on its OS), and `src/status.rs`. Build test `Paths` with `Paths::new(settings_file, config_dir, core_dir)`.
+- **Framework**: standard Rust `#[cfg(test)] mod tests` colocated at the bottom of `src/subscription.rs`, `src/pipeline.rs`, `src/script.rs`, `src/merge.rs`, `src/service/{launchd,systemd,rc}.rs` (each compiled only on its OS), and `src/status.rs`. Build test `Paths` with `Paths::new(settings_file, config_dir, core_dir)`.
 - **What to Test**:
   - **Boundary & security invariants**: controller loopback enforcement (`enforce_overrides_template_controller_settings`, `enforce_rejects_non_loopback_controller`), token URL redaction (`redact_strips_token_url`), placeholder port (`<= 1`) and IPv6 literal filtering (`extract_proxies`), root unit referencing only root-owned paths plus the `-f` config (`core_runs_only_root_owned_paths`), nodes filled after overrides (`nodes_fill_inline_providers_after_overrides`), `type: file` rejection (`local_file_providers_are_rejected`), diff masking of secret and node credentials (`diff_masking_keeps_node_names_only`), saturating userinfo parsing (`absurd_userinfo_values_saturate_instead_of_overflowing`), QuickJS sandbox isolation (`sandbox_exposes_no_host_capabilities`), infinite-loop timeout & OOM interruption (`failures_are_errors_not_fallbacks`), and YAML merge operator edge cases.
   - **Filesystem tests**: when creating temporary directories in unit tests (e.g., `src/pipeline.rs:296`), scope paths under `std::env::temp_dir()` with unique suffixes and clean up before asserting.

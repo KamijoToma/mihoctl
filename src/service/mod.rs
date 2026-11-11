@@ -1,6 +1,6 @@
 //! Service units: the core as a privileged system service (TUN needs root) and the scheduled
 //! refresh as a user job (it only talks to the controller, so it needs no privileges). launchd on
-//! macOS, systemd on Linux; elsewhere only the config pipeline is available.
+//! macOS, systemd on Linux, rc.d on FreeBSD; elsewhere only the config pipeline is available.
 //!
 //! Nothing the root core executes or writes may be user-writable, or any process running as the
 //! user gets root without a password: it runs a root-owned copy of mihomo, with a root-owned `-d`
@@ -18,14 +18,19 @@ mod systemd;
 #[cfg(target_os = "linux")]
 pub use systemd::*;
 
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+#[cfg(target_os = "freebsd")]
+mod rc;
+#[cfg(target_os = "freebsd")]
+pub use rc::*;
+
+#[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "freebsd")))]
 mod unsupported;
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+#[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "freebsd")))]
 pub use unsupported::*;
 
 use crate::settings::Settings;
 
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "freebsd"))]
 use {
     crate::settings::Paths,
     crate::{core, pipeline},
@@ -48,12 +53,12 @@ pub fn runtime_mihomo(settings: &Settings) -> String {
 }
 
 /// Seeded from `core_dir` on install so the core can start where GitHub is blocked.
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "freebsd"))]
 const GEODATA: [&str; 6] = ["GEOSITE.dat", "geoip.metadb", "ASN.mmdb", "geosite.dat", "geoip.dat", "Country.mmdb"];
 
 /// The core starts straight from config.yaml: refuse a missing binary, or a config an older
 /// mihoctl built with `file` providers, or one the binary about to be installed rejects.
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "freebsd"))]
 fn check_installable(settings: &Settings, paths: &Paths) -> Result<()> {
     let config = paths.config();
     if !config.exists() {
@@ -73,7 +78,7 @@ fn check_installable(settings: &Settings, paths: &Paths) -> Result<()> {
 /// Run a shell script as root in one `sudo` call (one password prompt). `$1…` are `args`; `stdin`
 /// is piped to the script (sudo reads the password from the tty, not stdin), so root-bound files
 /// never pass through a user-writable temp file. Uses `sudo -A` when `SUDO_ASKPASS` is set.
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "freebsd"))]
 fn sudo_sh(script: &str, args: &[&str], stdin: &str) -> Result<()> {
     let mut cmd = Command::new("sudo");
     if std::env::var_os("SUDO_ASKPASS").is_some() {

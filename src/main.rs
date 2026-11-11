@@ -64,7 +64,7 @@ enum Cmd {
         #[arg(long)]
         update: bool,
     },
-    /// Install/remove the service units (launchd on macOS, systemd on Linux)
+    /// Install/remove the service units (launchd on macOS, systemd on Linux, rc.d on FreeBSD)
     Service {
         #[command(subcommand)]
         action: ServiceAction,

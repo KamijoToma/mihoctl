@@ -11,7 +11,7 @@ pub const REFRESH_NAME: &str = "refresh";
 
 fn unsupported<T>() -> Result<T> {
     bail!(
-        "`mihoctl service` supports launchd (macOS) and systemd (Linux) only; run the core and schedule `mihoctl refresh` yourself"
+        "`mihoctl service` supports launchd (macOS), systemd (Linux) and rc.d (FreeBSD) only; run the core and schedule `mihoctl refresh` yourself"
     )
 }
 

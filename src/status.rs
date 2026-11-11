@@ -21,7 +21,7 @@ pub struct Status {
 
 #[derive(Serialize)]
 pub struct Service {
-    /// `launchd`, `systemd`, or `none` where mihoctl doesn't manage the core.
+    /// `launchd`, `systemd`, `rc.d`, or `none` where mihoctl doesn't manage the core.
     pub manager: &'static str,
     pub core: bool,
     pub refresh: bool,
