@@ -75,6 +75,7 @@ Subscriptions must return mihomo YAML when requested with `user_agent`. Placehol
 | `mihoctl refresh` | `update` + `apply` (the scheduled job) |
 | `mihoctl status [--json]` | service state, core version/mode/TUN, per-subscription node counts, traffic/expiry, last errors. `--json` is for scripts and never includes subscription URLs or the secret |
 | `mihoctl ui [--update]` | zashboard URL pre-filled with controller and secret |
+| `mihoctl ui --tailscale [--path P] [--port N] [--unpublish]` | Publish the dashboard on your tailnet with Tailscale Serve and print that URL; `--unpublish` removes it |
 | `mihoctl service install\|uninstall\|restart\|print` | Manage the launchd/systemd/rc.d units. `restart` is needed after editing `tun:`. `uninstall` also deletes the root-owned binary and core home |
 
 Root steps (`service install/uninstall/restart`) run as a single `sudo` call. Set `SUDO_ASKPASS` to get a GUI password prompt.
@@ -99,11 +100,47 @@ Restore recovers **one subscription's nodes, not a historical whole runtime conf
 
 The shared non-blocking process lock covers history/restore. Restore protects both the selected provider cache and installed config, then validates and uses payload hot reload plus the group probe. A build, validation, install, reload, probe, history-commit or state-save failure attempts cache, config, runtime (when changed), and state recovery independently and reports rollback failures. A live core requires an existing validated rollback config before changing nodes. If no core is running, success means **installed for next start, not reloaded or probed**. Failed candidate files are removed. Restore updates node counts and records `restored_at`/last-apply information without pretending to download a subscription or clearing its last download-failure diagnostics; traffic/expiry metadata remains from the last download.
 
+### Remote control over Tailscale
+
+The core's controller stays on loopback, so reaching the dashboard from another machine needs a
+reverse proxy. With Tailscale installed and logged in, `mihoctl ui --tailscale` publishes the
+dashboard on your tailnet and prints the URL to open:
+
+```sh
+mihoctl ui --tailscale                 # publish and print the tailnet URL
+mihoctl ui --tailscale --unpublish     # remove the publication
+```
+
+Tailscale Serve terminates TLS on the node's MagicDNS name and forwards to the core on loopback,
+so the dashboard is reachable only by tailnet members, with a real certificate and no port opened
+on the local network. The published URL carries the controller secret, exactly like the local
+`mihoctl ui` URL — treat it as a credential.
+
+The dashboard is mounted under a path prefix (`/mihoctl` by default) so the node's HTTPS root stays
+free for other services. `--path /` claims the root instead; `--port` picks another tailnet port.
+Both can be set in `mihoctl.toml`:
+
+```toml
+[tailscale]
+path = "/mihoctl"
+port = 443
+```
+
+Publishing uses the `tailscale` CLI that Tailscale installs, because that is the supported
+interface for Serve and it handles MagicDNS discovery, certificate provisioning and the
+configuration update for you. On Linux the `tailscaled` socket only grants write access to root and
+to the operator user (`tailscale set --operator=$USER`), so mihoctl retries under `sudo` when the
+daemon refuses the change.
+
+The publication survives reboots (Serve keeps running in the background) and is removed with
+`mihoctl ui --tailscale --unpublish`. Other Serve configuration on the same node is left alone.
+
 ## Platforms
 
 | | macOS | Linux | FreeBSD |
 |---|---|---|---|
 | `update` / `history` / `restore` / `build` / `diff` / `apply` / `refresh` / `status` / `ui` | yes | yes | yes |
+| `ui --tailscale` | yes, needs the `tailscale` CLI; the App Store/system-extension build authenticates over a loopback TCP port | yes, needs the `tailscale` CLI; publishing as a non-root user needs `tailscale set --operator=$USER` or `sudo` | yes, needs the `tailscale` CLI |
 | `service` | launchd | systemd | rc.d + cron |
 | Default settings file | `~/.config/mihoctl/mihoctl.toml` | `$XDG_CONFIG_HOME/mihoctl/mihoctl.toml` | same as Linux |
 | Default `core_dir` | `~/Library/Application Support/mihoctl/core` | `$XDG_DATA_HOME/mihoctl/core` | same as Linux |

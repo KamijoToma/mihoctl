@@ -35,6 +35,9 @@ pub struct Settings {
     pub health_check: HealthCheck,
     #[serde(default, rename = "subscription")]
     pub subscriptions: Vec<Subscription>,
+    /// How the dashboard is published on the tailnet.
+    #[serde(default)]
+    pub tailscale: Tailscale,
 }
 
 #[derive(Debug, Deserialize)]
@@ -126,6 +129,31 @@ fn default_health_url() -> String {
 }
 fn default_health_timeout() -> u64 {
     5000
+}
+
+/// How `mihoctl ui --tailscale` publishes the dashboard on the tailnet.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Tailscale {
+    /// Mount path on the tailnet. A prefix leaves the node's HTTPS root free for other services.
+    #[serde(default = "default_tailscale_path")]
+    pub path: String,
+    /// The tailnet HTTPS port to publish on.
+    #[serde(default = "default_tailscale_port")]
+    pub port: u16,
+}
+
+impl Default for Tailscale {
+    fn default() -> Self {
+        Self { path: default_tailscale_path(), port: default_tailscale_port() }
+    }
+}
+
+fn default_tailscale_path() -> String {
+    "/mihoctl".into()
+}
+fn default_tailscale_port() -> u16 {
+    443
 }
 
 /// Resolved locations used by every command.
@@ -260,4 +288,35 @@ pub fn parse_duration(raw: &str) -> Result<Duration> {
         bail!("duration must be positive");
     }
     Ok(Duration::from_secs(secs))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A minimal valid config, so each test only states what it is about.
+    fn toml_with(extra: &str) -> Result<Settings> {
+        let text = format!("template = \"t.yaml\"\nsecret = \"s3cret\"\n{extra}");
+        Ok(toml::from_str(&text)?)
+    }
+
+    #[test]
+    fn tailscale_defaults_to_a_prefixed_mount_on_443() {
+        let s = toml_with("").unwrap();
+        assert_eq!(s.tailscale.path, "/mihoctl");
+        assert_eq!(s.tailscale.port, 443);
+    }
+
+    #[test]
+    fn tailscale_section_overrides_the_defaults() {
+        let s = toml_with("[tailscale]\npath = \"/dash\"\nport = 8443\n").unwrap();
+        assert_eq!(s.tailscale.path, "/dash");
+        assert_eq!(s.tailscale.port, 8443);
+    }
+
+    #[test]
+    fn an_unknown_tailscale_key_is_rejected() {
+        let err = toml_with("[tailscale]\nprot = 443\n").unwrap_err().to_string();
+        assert!(err.contains("unknown field"), "unexpected error: {err}");
+    }
 }

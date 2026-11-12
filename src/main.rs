@@ -9,7 +9,7 @@ mod settings;
 mod state;
 mod status;
 mod subscription;
-
+mod tailscale;
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use pipeline::Applied;
@@ -63,6 +63,19 @@ enum Cmd {
         /// Ask the core to (re)download the dashboard first
         #[arg(long)]
         update: bool,
+        /// Publish the dashboard on the tailnet with Tailscale Serve and print that URL
+        #[arg(long)]
+        tailscale: bool,
+        /// Mount path on the tailnet; `/` claims the node's HTTPS root
+        /// (defaults to `tailscale.path` in mihoctl.toml)
+        #[arg(long)]
+        path: Option<String>,
+        /// The tailnet HTTPS port to publish on (defaults to `tailscale.port`)
+        #[arg(long)]
+        port: Option<u16>,
+        /// Remove the tailnet publication instead of creating it
+        #[arg(long)]
+        unpublish: bool,
     },
     /// Install/remove the service units (launchd on macOS, systemd on Linux, rc.d on FreeBSD)
     Service {
@@ -174,19 +187,26 @@ fn run() -> Result<()> {
             let s = status::gather(&settings, &paths)?;
             if json { status::print_json(&s)? } else { status::print_text(&s) }
         }
-        Cmd::Ui { update } => {
+        Cmd::Ui { update, tailscale, path, port, unpublish } => {
             let ctl = core::Controller::new(&settings.controller, &settings.secret);
             if update {
                 ctl.update_ui()?;
             }
-            let (host, port) = settings.controller.rsplit_once(':').context("controller must be host:port")?;
-            println!(
-                "http://{}/ui/#/setup?hostname={}&port={}&secret={}",
-                settings.controller,
-                core::encode(host),
-                port,
-                core::encode(&settings.secret)
-            );
+            if tailscale {
+                let path = path.unwrap_or_else(|| settings.tailscale.path.clone());
+                let port = port.unwrap_or(settings.tailscale.port);
+                ui_tailscale(&settings, &path, port, unpublish)?;
+            } else {
+                let (host, port) =
+                    settings.controller.rsplit_once(':').context("controller must be host:port")?;
+                println!(
+                    "http://{}/ui/#/setup?hostname={}&port={}&secret={}",
+                    settings.controller,
+                    core::encode(host),
+                    port,
+                    core::encode(&settings.secret)
+                );
+            }
         }
         Cmd::Service { action } => match action {
             ServiceAction::Install => {
@@ -208,6 +228,52 @@ fn run() -> Result<()> {
     }
     Ok(())
 }
+
+/// Publish (or unpublish) the dashboard on the tailnet and print the URL to open.
+///
+/// The core's controller stays on loopback; Tailscale Serve is the reverse proxy in front of it,
+/// terminating TLS on the node's MagicDNS name. The dashboard is opened through that proxy, so the
+/// URL points at the tailnet host and carries the mount prefix as the API's secondary path; the
+/// secret travels in the fragment, which the browser never sends to the server.
+fn ui_tailscale(settings: &Settings, path: &str, port: u16, unpublish: bool) -> Result<()> {
+    let mount = tailscale::Mount::new(path);
+    let node = tailscale::node()?;
+
+    if unpublish {
+        tailscale::unserve(&node, &mount, port)?;
+        eprintln!("removed the tailnet publication at {}", node.dns_name);
+        return Ok(());
+    }
+
+    let target = controller_target(settings)?;
+    let served = tailscale::serve(&node, &target, &mount, port)?;
+    let prefix = if served.path == "/" { "" } else { &served.path };
+    println!(
+        "{}/ui/#/setup?protocol=https&hostname={}&port={}&secondaryPath={}&secret={}",
+        served.url,
+        core::encode(&node.dns_name),
+        port,
+        core::encode(prefix),
+        core::encode(&settings.secret)
+    );
+    Ok(())
+}
+
+/// The loopback address the tailnet proxy forwards to.
+fn controller_target(settings: &Settings) -> Result<String> {
+    let (host, port) = settings.controller.rsplit_once(':').context("controller must be host:port")?;
+    // Tailscale Serve proxies to loopback only. `localhost` is used for an IPv6 controller because
+    // the proxy resolves it to whichever family the core bound.
+    let host = match host {
+        "localhost" | "127.0.0.1" => "127.0.0.1",
+        "[::1]" => "localhost",
+        other => bail!(
+            "controller host {other:?} is not a loopback address; Tailscale Serve can only proxy to loopback"
+        ),
+    };
+    Ok(format!("http://{host}:{port}"))
+}
+
 
 /// Returns how many subscriptions failed.
 fn update(settings: &Settings, paths: &Paths, names: &[String], proxy: Option<String>) -> Result<usize> {
