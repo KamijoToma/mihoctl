@@ -14,6 +14,8 @@ A headless manager for the [mihomo](https://github.com/MetaCubeX/mihomo) core on
 
 ## Install
 
+Prebuilt binaries for macOS (Apple Silicon, Intel), Linux (x86_64, aarch64; static musl) and FreeBSD (x86_64) are attached to each [GitHub release](https://github.com/KamijoToma/mihoctl/releases). Download the archive for your platform, put `mihoctl` on your `PATH`, and use [`mihoctl self-update`](#self-update) from then on. Or build from source:
+
 ```sh
 brew install mihomo
 cargo install --path .
@@ -74,6 +76,7 @@ Subscriptions must return mihomo YAML when requested with `user_agent`. Placehol
 | `mihoctl apply` | Build, validate, install and hot-reload, then health-check; roll back on failure |
 | `mihoctl refresh` | `update` + `apply` (the scheduled job) |
 | `mihoctl status [--json]` | service state, core version/mode/TUN, per-subscription node counts, traffic/expiry, last errors. `--json` is for scripts and never includes subscription URLs or the secret |
+| `mihoctl self-update [--check] [--version V] [--proxy URL]` | Replace this binary with the latest GitHub release, after verifying its SHA-256. `--check` only reports; `--version` installs a specific release, older ones included |
 | `mihoctl ui [--update]` | zashboard URL pre-filled with controller and secret |
 | `mihoctl ui --tailscale [--path P] [--port N] [--unpublish]` | Publish the dashboard on your tailnet with Tailscale Serve and print that URL; `--unpublish` removes it |
 | `mihoctl service install\|uninstall\|restart\|print` | Manage the launchd/systemd/rc.d units. `restart` is needed after editing `tun:`. `uninstall` also deletes the root-owned binary and core home |
@@ -99,6 +102,22 @@ Snapshots live under `<core_dir>/history/<subscription>/<sha256>.json` (director
 Restore recovers **one subscription's nodes, not a historical whole runtime configuration**. It uses today's template, overrides, other cached providers and controller settings. Retained updates are **not guaranteed healthy snapshots**. Restore performs no subscription HTTP request or subscription DNS lookup and does not run `update`; it is not promised to be network-free: `mihomo -t` may need geodata, and a running core's group health check intentionally uses the network. Its probe covers `health_check.group`, not specifically the restored provider; a zero-alive response fails even with HTTP 200. Override console output and detailed source/controller error text are withheld during restore to avoid exposing credentials.
 
 The shared non-blocking process lock covers history/restore. Restore protects both the selected provider cache and installed config, then validates and uses payload hot reload plus the group probe. A build, validation, install, reload, probe, history-commit or state-save failure attempts cache, config, runtime (when changed), and state recovery independently and reports rollback failures. A live core requires an existing validated rollback config before changing nodes. If no core is running, success means **installed for next start, not reloaded or probed**. Failed candidate files are removed. Restore updates node counts and records `restored_at`/last-apply information without pretending to download a subscription or clearing its last download-failure diagnostics; traffic/expiry metadata remains from the last download.
+
+### Self-update
+
+```sh
+mihoctl self-update --check      # is a newer release out?
+mihoctl self-update              # install the latest release
+mihoctl self-update --version 0.1.0   # pin or roll back to a specific release
+```
+
+`self-update` asks the GitHub API for the latest published release (drafts and `-rc` prereleases are skipped), downloads `mihoctl-<tag>-<target>.tar.gz` and `SHA256SUMS.txt` from it, and refuses to continue unless the archive's SHA-256 matches. It then stages the new binary next to the current one, runs it with `--version` to check that it starts and reports the release's version, and only then renames it over the old one. Any failure leaves the installed binary untouched. A plain `self-update` never downgrades; `--version` can.
+
+The checksum comes from the same release as the archive, so it catches corrupt or truncated downloads and a mismatched upload, not a compromised GitHub account.
+
+It needs no valid `mihoctl.toml`, so it still works when the config is broken. GitHub is reached through the running core's mixed port first and directly (honoring `HTTPS_PROXY` and friends) if that fails; `--proxy URL` overrides both. The binary's directory must be writable by you; mihoctl never uses `sudo` for this. Only mihoctl is replaced: the root-owned `mihomo` copy and the service units are untouched, and the launchd/systemd/cron refresh job picks up the new binary on its next run, because it points at the same path.
+
+Releases come from `.github/workflows/release.yml`: pushing a tag `vX.Y.Z` that matches the `Cargo.toml` version runs clippy and the tests, builds every platform, and publishes the archives, source tarballs and `SHA256SUMS.txt`. A tag with a suffix (`v0.2.0-rc.1`) is published as a prerelease.
 
 ### Remote control over Tailscale
 

@@ -4,6 +4,7 @@ mod merge;
 mod pipeline;
 mod restore;
 mod script;
+mod selfupdate;
 mod service;
 mod settings;
 mod state;
@@ -77,6 +78,18 @@ enum Cmd {
         #[arg(long)]
         unpublish: bool,
     },
+    /// Replace this binary with the latest GitHub release (checksum-verified)
+    SelfUpdate {
+        /// Only report whether a newer release exists
+        #[arg(long)]
+        check: bool,
+        /// Install this release (e.g. 0.2.0) instead of the latest; may be older than the current one
+        #[arg(long)]
+        version: Option<String>,
+        /// Proxy for GitHub instead of the running core's mixed port, e.g. http://127.0.0.1:7897
+        #[arg(long)]
+        proxy: Option<String>,
+    },
     /// Install/remove the service units (launchd on macOS, systemd on Linux, rc.d on FreeBSD)
     Service {
         #[command(subcommand)]
@@ -107,6 +120,11 @@ fn run() -> Result<()> {
         Some(p) => p,
         None => settings::default_settings_file()?,
     };
+    // Needs no valid settings (a broken config is a reason to update), only a proxy hint from them.
+    if let Cmd::SelfUpdate { check, version, proxy } = &cli.cmd {
+        let core_proxy = settings::load(&file).ok().and_then(|(settings, _)| core_mixed_proxy(&settings));
+        return selfupdate::run(*check, version.as_deref(), proxy.as_deref(), core_proxy);
+    }
     let (settings, paths) = settings::load(&file)?;
     std::fs::create_dir_all(&paths.providers_dir)
         .with_context(|| format!("creating {}", paths.providers_dir.display()))?;
@@ -208,6 +226,7 @@ fn run() -> Result<()> {
                 );
             }
         }
+        Cmd::SelfUpdate { .. } => unreachable!("handled before the settings are loaded"),
         Cmd::Service { action } => match action {
             ServiceAction::Install => {
                 service::install(&settings, &paths)?;
