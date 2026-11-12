@@ -57,6 +57,12 @@ jobs:
       - name: Build release binary
         run: cargo build --release --locked --target ${{ matrix.target }}
 
+      # `mihoctl self-update` looks for <dir>/mihoctl inside the archive; catch a layout change here, not at release.
+      - name: Dry-run release packaging
+        run: |
+          sh .github/scripts/package.sh v0.0.0 ${{ matrix.target }} target/${{ matrix.target }}/release/mihoctl
+          tar -tzf dist/mihoctl-v0.0.0-${{ matrix.target }}.tar.gz | grep -qx "mihoctl-v0.0.0-${{ matrix.target }}/mihoctl"
+
   freebsd:
     name: Check, Clippy & Test (x86_64-unknown-freebsd)
     runs-on: ubuntu-latest
