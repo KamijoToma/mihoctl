@@ -1,44 +1,39 @@
 //! `mihoctl self-update`: replace the running binary with a GitHub release build.
 //!
+//! Releases are found and downloaded through github.com's web endpoints, never the REST API: its
+//! anonymous quota is 60 requests an hour per address, and people who need a proxy share an exit
+//! address with strangers, so that quota is routinely spent before they ask.
+//!
 //! The asset names, the archive layout and `SHA256SUMS.txt` are a contract with
-//! `.github/workflows/release.yml`: `mihoctl-<tag>-<target>.tar.gz` holds `mihoctl-<tag>-<target>/mihoctl`.
+//! `.github/workflows/release.yml`: `mihoctl-<tag>-<target>.tar.gz` holds `mihoctl-<tag>-<target>/mihoctl`,
+//! and the checksum file lists every asset, which is also how a missing platform build is noticed.
 //! Only the user-owned binary is replaced. The root core runs its own root-owned copy of mihomo and never
 //! executes mihoctl, so nothing here widens the privilege split.
 
 use anyhow::{Context, Result, anyhow, bail};
 use semver::Version;
-use serde_json::Value;
 use sha2::{Digest, Sha256};
+use std::cell::Cell;
 use std::io::{Read, Write};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::Path;
 use std::process::Command;
 use std::time::Duration;
 
+const WEB: &str = "https://github.com";
 const REPO: &str = "KamijoToma/mihoctl";
 const BIN: &str = "mihoctl";
 const CHECKSUMS: &str = "SHA256SUMS.txt";
 const MAX_SUMS: u64 = 1 << 20;
 const MAX_ARCHIVE: u64 = 64 << 20;
 const MAX_BINARY: u64 = 128 << 20;
+const RATE_LIMITED: &str = "GitHub is limiting requests from this address; try again later or use --proxy";
 
-/// Where releases come from. Tests point it at a local server.
-#[derive(Clone)]
-struct Github {
-    api: String,
-    web: String,
-}
-
-impl Github {
-    fn official() -> Self {
-        Self { api: "https://api.github.com".into(), web: "https://github.com".into() }
-    }
-}
+type Route = (&'static str, Option<ureq::Proxy>);
 
 struct Release {
     tag: String,
     version: Version,
-    assets: Vec<String>,
 }
 
 /// The release build this platform runs. Linux builds are static musl, so they also serve glibc systems.
@@ -55,24 +50,15 @@ fn target_for(os: &str, arch: &str) -> Option<&'static str> {
 
 /// `v1.2.3` or `1.2.3` to the release tag. Anything that is not a semantic version is rejected, which
 /// also guarantees the tag is safe to put into a URL path.
-fn tag_version(raw: &str) -> Result<(String, Version)> {
+fn release_of(raw: &str) -> Result<Release> {
     let bare = raw.strip_prefix('v').unwrap_or(raw);
     let version = Version::parse(bare).with_context(|| format!("{raw:?} is not a release version like 1.2.3"))?;
-    Ok((format!("v{bare}"), version))
+    Ok(Release { tag: format!("v{bare}"), version })
 }
 
-fn parse_release(doc: &Value) -> Result<Release> {
-    let raw = doc["tag_name"].as_str().context("release has no tag_name")?;
-    let (tag, version) = tag_version(raw)?;
-    let assets = doc["assets"]
-        .as_array()
-        .map(|a| a.iter().filter_map(|a| a["name"].as_str()).map(str::to_string).collect())
-        .unwrap_or_default();
-    Ok(Release { tag, version, assets })
-}
-
-/// The digest `SHA256SUMS.txt` lists for `name` (`<hex>  <name>` per line, `*` marks binary mode).
-fn checksum_for(sums: &str, name: &str) -> Result<String> {
+/// The digest `SHA256SUMS.txt` lists for `name` (`<hex>  <name>` per line, `*` marks binary mode);
+/// `None` when the release does not contain that asset.
+fn checksum_for(sums: &str, name: &str) -> Result<Option<String>> {
     for line in sums.lines() {
         let Some((digest, file)) = line.split_once(char::is_whitespace) else { continue };
         if file.trim_start().trim_start_matches('*') != name {
@@ -81,9 +67,9 @@ fn checksum_for(sums: &str, name: &str) -> Result<String> {
         if digest.len() != 64 || !digest.bytes().all(|b| b.is_ascii_hexdigit()) {
             bail!("{CHECKSUMS} has a malformed digest for {name}");
         }
-        return Ok(digest.to_ascii_lowercase());
+        return Ok(Some(digest.to_ascii_lowercase()));
     }
-    bail!("{CHECKSUMS} does not list {name}")
+    Ok(None)
 }
 
 /// The regular file at exactly `path` in a `.tar.gz`. Everything else in the archive is ignored, and
@@ -140,83 +126,98 @@ fn replace(exe: &Path, binary: &[u8], expected: &Version) -> Result<()> {
     result
 }
 
+struct Reply {
+    status: u16,
+    location: Option<String>,
+    body: Vec<u8>,
+}
+
+/// GitHub over one or more routes. A request that cannot reach GitHub moves on to the next route;
+/// an answer, whatever its status, is final.
 struct Client {
-    agent: ureq::Agent,
-    github: Github,
+    web: String,
+    routes: Vec<(&'static str, ureq::Agent)>,
+    /// The first route not known to be dead, so later requests do not retry the ones that failed.
+    route: Cell<usize>,
 }
 
 impl Client {
-    fn new(github: Github, proxy: Option<ureq::Proxy>) -> Self {
-        let agent = ureq::Agent::config_builder()
-            .proxy(proxy)
-            .user_agent(concat!("mihoctl/", env!("CARGO_PKG_VERSION")))
-            .https_only(github.api.starts_with("https://"))
-            .http_status_as_error(false)
-            .timeout_connect(Some(Duration::from_secs(10)))
-            // A proxy whose node is dead accepts the connection and then says nothing.
-            .timeout_recv_response(Some(Duration::from_secs(20)))
-            .timeout_global(Some(Duration::from_secs(300)))
-            .build()
-            .into();
-        Self { agent, github }
+    fn new(web: &str, routes: Vec<Route>) -> Self {
+        let routes = routes
+            .into_iter()
+            .map(|(label, proxy)| {
+                let agent = ureq::Agent::config_builder()
+                    .proxy(proxy)
+                    .user_agent(concat!("mihoctl/", env!("CARGO_PKG_VERSION")))
+                    .https_only(web.starts_with("https://"))
+                    .http_status_as_error(false)
+                    .timeout_connect(Some(Duration::from_secs(10)))
+                    // A proxy whose node is dead accepts the connection and then says nothing.
+                    .timeout_recv_response(Some(Duration::from_secs(20)))
+                    .timeout_global(Some(Duration::from_secs(300)))
+                    .build()
+                    .into();
+                (label, agent)
+            })
+            .collect();
+        Self { web: web.to_string(), routes, route: Cell::new(0) }
     }
 
-    fn fetch(&self, url: &str, api: bool, limit: u64) -> Result<(u16, Vec<u8>)> {
-        let mut req = self.agent.get(url);
-        if api {
-            req = req.header("Accept", "application/vnd.github+json").header("X-GitHub-Api-Version", "2022-11-28");
+    fn get(&self, url: &str, limit: u64, follow: bool) -> Result<Reply> {
+        let mut errors = Vec::new();
+        for (i, (label, agent)) in self.routes.iter().enumerate().skip(self.route.get()) {
+            match send(agent, url, limit, follow) {
+                Ok(reply) => {
+                    self.route.set(i);
+                    return Ok(reply);
+                }
+                Err(e) => errors.push(format!("{label}: {e:#}")),
+            }
         }
-        let mut resp = req.call().with_context(|| format!("GET {url}"))?;
-        let status = resp.status().as_u16();
-        let body = resp.body_mut().with_config().limit(limit).read_to_vec().with_context(|| format!("reading {url}"))?;
-        Ok((status, body))
+        bail!("could not reach GitHub: {}", errors.join("; "))
     }
 
-    /// The latest published release (GitHub leaves out drafts and prereleases), or the one tagged `tag`.
-    fn release(&self, tag: Option<&str>) -> Result<Release> {
-        let path = match tag {
-            Some(tag) => format!("tags/{tag}"),
-            None => "latest".into(),
-        };
-        let (status, body) = self.fetch(&format!("{}/repos/{REPO}/releases/{path}", self.github.api), true, MAX_SUMS)?;
-        match status {
-            200 => {}
-            404 => bail!("{}", tag.map_or_else(|| "no release has been published yet".into(), |t| format!("release {t} does not exist"))),
-            403 | 429 => bail!("GitHub API rate limit reached; try again later or use --proxy"),
-            other => bail!("GitHub API answered HTTP {other}"),
+    /// The latest published release (GitHub leaves out drafts and prereleases). `/releases/latest`
+    /// redirects to `/releases/tag/<tag>`, or to the bare `/releases` list while nothing is published.
+    fn latest(&self) -> Result<Release> {
+        let reply = self.get(&format!("{}/{REPO}/releases/latest", self.web), MAX_SUMS, false)?;
+        match reply.status {
+            301 | 302 | 303 | 307 | 308 => {}
+            404 => bail!("{REPO} was not found on GitHub"),
+            403 | 429 => bail!(RATE_LIMITED),
+            other => bail!("GitHub answered HTTP {other} to the latest-release lookup"),
         }
-        parse_release(&serde_json::from_slice(&body).context("parsing the release")?)
+        let location = reply.location.unwrap_or_default();
+        match location.split_once("/releases/tag/") {
+            Some((_, tag)) => release_of(tag.split(['?', '#']).next().unwrap_or(tag)),
+            None => bail!("no release has been published yet"),
+        }
     }
 
-    fn asset(&self, release: &Release, name: &str, limit: u64) -> Result<Vec<u8>> {
-        if !release.assets.iter().any(|a| a == name) {
-            bail!("release {} has no asset {name}", release.tag);
-        }
-        let url = format!("{}/{REPO}/releases/download/{}/{name}", self.github.web, release.tag);
-        match self.fetch(&url, false, limit)? {
-            (200, body) => Ok(body),
-            (status, _) => bail!("downloading {name}: HTTP {status}"),
+    /// `None` when the release has no such asset.
+    fn download(&self, release: &Release, name: &str, limit: u64) -> Result<Option<Vec<u8>>> {
+        let reply = self.get(&format!("{}/{REPO}/releases/download/{}/{name}", self.web, release.tag), limit, true)?;
+        match reply.status {
+            200 => Ok(Some(reply.body)),
+            404 => Ok(None),
+            403 | 429 => bail!(RATE_LIMITED),
+            other => bail!("downloading {name}: HTTP {other}"),
         }
     }
 }
 
-/// Look the release up, trying each route in order. Only transport failures move on to the next
-/// route; an answer from GitHub (even an error) is final.
-fn lookup(github: &Github, routes: Vec<(&'static str, Option<ureq::Proxy>)>, tag: Option<&str>) -> Result<(Client, Release)> {
-    let mut errors = Vec::new();
-    for (label, proxy) in routes {
-        let client = Client::new(github.clone(), proxy);
-        match client.release(tag) {
-            Ok(release) => return Ok((client, release)),
-            Err(e) if e.downcast_ref::<ureq::Error>().is_some() => errors.push(format!("{label}: {e:#}")),
-            Err(e) => return Err(e),
-        }
-    }
-    bail!("could not reach GitHub: {}", errors.join("; "))
+fn send(agent: &ureq::Agent, url: &str, limit: u64, follow: bool) -> Result<Reply> {
+    let request = agent.get(url);
+    let request = if follow { request } else { request.config().max_redirects(0).max_redirects_will_error(false).build() };
+    let mut resp = request.call().with_context(|| format!("GET {url}"))?;
+    let status = resp.status().as_u16();
+    let location = resp.headers().get("location").and_then(|v| v.to_str().ok()).map(str::to_string);
+    let body = resp.body_mut().with_config().limit(limit).read_to_vec().with_context(|| format!("reading {url}"))?;
+    Ok(Reply { status, location, body })
 }
 
 /// An explicit `--proxy`, else the running core's mixed port and then the environment's proxy settings.
-fn routes(proxy: Option<&str>, core_proxy: Option<String>) -> Result<Vec<(&'static str, Option<ureq::Proxy>)>> {
+fn routes(proxy: Option<&str>, core_proxy: Option<String>) -> Result<Vec<Route>> {
     if let Some(p) = proxy {
         return Ok(vec![("via --proxy", Some(ureq::Proxy::new(p)?))]);
     }
@@ -233,21 +234,18 @@ pub fn run(check: bool, version: Option<&str>, proxy: Option<&str>, core_proxy: 
     let target = target_for(OS, ARCH).ok_or_else(|| {
         anyhow!("no prebuilt mihoctl for {OS}/{ARCH}; build from source: cargo install --git https://github.com/{REPO}")
     })?;
-    let wanted = version.map(tag_version).transpose()?;
+    let wanted = version.map(release_of).transpose()?;
     let exe = std::env::current_exe()?.canonicalize().context("locating the running executable")?;
-    update(&Github::official(), routes(proxy, core_proxy)?, target, wanted.map(|(tag, _)| tag).as_deref(), check, &exe)
+    update(WEB, routes(proxy, core_proxy)?, target, wanted.map(|r| r.tag).as_deref(), check, &exe)
 }
 
-fn update(
-    github: &Github,
-    routes: Vec<(&'static str, Option<ureq::Proxy>)>,
-    target: &str,
-    tag: Option<&str>,
-    check: bool,
-    exe: &Path,
-) -> Result<()> {
+fn update(web: &str, routes: Vec<Route>, target: &str, tag: Option<&str>, check: bool, exe: &Path) -> Result<()> {
     let current = Version::parse(env!("CARGO_PKG_VERSION")).context("own version")?;
-    let (client, release) = lookup(github, routes, tag)?;
+    let client = Client::new(web, routes);
+    let release = match tag {
+        Some(tag) => release_of(tag)?,
+        None => client.latest()?,
+    };
 
     // Plain `self-update` only ever moves forward; naming a version is an explicit up- or downgrade.
     if release.version == current || (tag.is_none() && release.version < current) {
@@ -255,23 +253,28 @@ fn update(
         eprintln!("mihoctl {current} is up to date{note}; latest release is {}", release.tag);
         return Ok(());
     }
+
+    let stem = format!("{BIN}-{}-{target}", release.tag);
+    let name = format!("{stem}.tar.gz");
+    let sums = client
+        .download(&release, CHECKSUMS, MAX_SUMS)?
+        .with_context(|| format!("release {} does not exist or has no {CHECKSUMS}", release.tag))?;
+    let Some(expected) = checksum_for(&String::from_utf8_lossy(&sums), &name)? else {
+        bail!("release {} has no build for {target}; build from source: cargo install --git https://github.com/{REPO}", release.tag);
+    };
+
     let verb = if release.version > current { "upgrade" } else { "downgrade" };
     eprintln!("{verb}: mihoctl {current} -> {} ({target})", release.version);
-    eprintln!("release notes: {}/{REPO}/releases/tag/{}", github.web, release.tag);
+    eprintln!("release notes: {web}/{REPO}/releases/tag/{}", release.tag);
     if check {
         eprintln!("run `mihoctl self-update{}` to install it", tag.map(|t| format!(" --version {t}")).unwrap_or_default());
         return Ok(());
     }
 
-    let stem = format!("{BIN}-{}-{target}", release.tag);
-    let name = format!("{stem}.tar.gz");
-    if !release.assets.contains(&name) {
-        bail!("release {} has no build for {target}; build from source: cargo install --git https://github.com/{REPO}", release.tag);
-    }
-    let sums = client.asset(&release, CHECKSUMS, MAX_SUMS)?;
-    let expected = checksum_for(&String::from_utf8_lossy(&sums), &name)?;
     eprintln!("downloading {name}");
-    let archive = client.asset(&release, &name, MAX_ARCHIVE)?;
+    let archive = client
+        .download(&release, &name, MAX_ARCHIVE)?
+        .with_context(|| format!("release {} has no {name}", release.tag))?;
     let actual = format!("{:x}", Sha256::digest(&archive));
     if actual != expected {
         bail!("{name} does not match {CHECKSUMS} (expected {expected}, got {actual}); not installing it");
@@ -285,7 +288,7 @@ fn update(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::BufRead;
+    use std::io::{BufRead, BufReader};
     use std::net::TcpListener;
     use std::path::PathBuf;
 
@@ -320,45 +323,72 @@ mod tests {
         archive(&[(&format!("{stem}/README.md"), b"readme"), (&format!("{stem}/{BIN}"), &script(version))])
     }
 
-    /// Serves `routes` (path, body) on a loopback port until the test process exits.
-    fn serve(routes: Vec<(String, Vec<u8>)>) -> String {
+    /// What the loopback server answers for one path.
+    struct Canned {
+        status: &'static str,
+        headers: String,
+        body: Vec<u8>,
+    }
+
+    fn ok(body: impl Into<Vec<u8>>) -> Canned {
+        Canned { status: "200 OK", headers: String::new(), body: body.into() }
+    }
+
+    fn redirect(to: &str) -> Canned {
+        Canned { status: "302 Found", headers: format!("Location: {to}\r\n"), body: b"redirecting".to_vec() }
+    }
+
+    fn refuse(status: &'static str) -> Canned {
+        Canned { status, headers: String::new(), body: Vec::new() }
+    }
+
+    /// Serves `routes` on a loopback port until the test process exits; anything else is a 404.
+    fn serve(routes: Vec<(String, Canned)>) -> String {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
         std::thread::spawn(move || {
-            for stream in listener.incoming().flatten() {
+            for mut stream in listener.incoming().flatten() {
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
                 let mut line = String::new();
-                std::io::BufReader::new(&stream).read_line(&mut line).ok();
+                reader.read_line(&mut line).ok();
                 let path = line.split_whitespace().nth(1).unwrap_or("/").to_string();
-                let mut stream = stream;
-                let (status, body) = match routes.iter().find(|(p, _)| *p == path) {
-                    Some((_, body)) => ("200 OK", body.as_slice()),
-                    None => ("404 Not Found", &b"{}"[..]),
+                // Drain the request head so closing the socket cannot reset the connection mid-response.
+                while reader.read_line(&mut line).is_ok_and(|n| n > 2) {}
+                let (status, headers, body) = match routes.iter().find(|(p, _)| *p == path) {
+                    Some((_, c)) => (c.status, c.headers.as_str(), c.body.as_slice()),
+                    None => ("404 Not Found", "", &b""[..]),
                 };
-                let head = format!("HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len());
+                let head = format!("HTTP/1.1 {status}\r\n{headers}Content-Length: {}\r\nConnection: close\r\n\r\n", body.len());
                 stream.write_all(head.as_bytes()).and_then(|_| stream.write_all(body)).ok();
             }
         });
         base
     }
 
-    fn release_server(archive: &[u8], sums: Option<String>) -> Github {
-        let name = format!("mihoctl-{TAG}-{TARGET}.tar.gz");
-        let sums = sums.unwrap_or_else(|| format!("{:x}  {name}\n{:x}  other.zip\n", Sha256::digest(archive), Sha256::digest(b"x")));
-        let api = serde_json::json!({
-            "tag_name": TAG,
-            "assets": [{ "name": name }, { "name": CHECKSUMS }],
-        });
-        let base = serve(vec![
-            (format!("/repos/{REPO}/releases/latest"), api.to_string().into_bytes()),
-            (format!("/repos/{REPO}/releases/tags/{TAG}"), api.to_string().into_bytes()),
-            (format!("/{REPO}/releases/download/{TAG}/{name}"), archive.to_vec()),
-            (format!("/{REPO}/releases/download/{TAG}/{CHECKSUMS}"), sums.into_bytes()),
-        ]);
-        Github { api: base.clone(), web: base }
+    fn download_path(name: &str) -> String {
+        format!("/{REPO}/releases/download/{TAG}/{name}")
     }
 
-    fn direct() -> Vec<(&'static str, Option<ureq::Proxy>)> {
+    /// The checksum file and archive of release `TAG`; `sums` replaces the real checksum file.
+    fn release_routes(archive: &[u8], sums: Option<String>) -> Vec<(String, Canned)> {
+        let name = format!("mihoctl-{TAG}-{TARGET}.tar.gz");
+        let sums = sums.unwrap_or_else(|| format!("{:x}  {name}\n{:x}  other.zip\n", Sha256::digest(archive), Sha256::digest(b"x")));
+        vec![(download_path(CHECKSUMS), ok(sums)), (download_path(&name), ok(archive))]
+    }
+
+    /// `/releases/latest` as GitHub answers it: a redirect to the release's page, which is never followed.
+    fn latest(tag: &str) -> (String, Canned) {
+        (format!("/{REPO}/releases/latest"), redirect(&format!("https://github.com/{REPO}/releases/tag/{tag}")))
+    }
+
+    fn direct() -> Vec<Route> {
         vec![("direct", None)]
+    }
+
+    /// A route through a proxy that is not listening.
+    fn dead(label: &'static str) -> Route {
+        let addr = TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap();
+        (label, Some(ureq::Proxy::new(&format!("http://{addr}")).unwrap()))
     }
 
     fn installed(dir: &Path) -> PathBuf {
@@ -370,6 +400,10 @@ mod tests {
 
     fn says(exe: &Path) -> String {
         String::from_utf8(Command::new(exe).output().unwrap().stdout).unwrap().trim().to_string()
+    }
+
+    fn error(result: Result<()>) -> String {
+        format!("{:#}", result.unwrap_err())
     }
 
     #[test]
@@ -385,30 +419,20 @@ mod tests {
 
     #[test]
     fn tags_must_be_semantic_versions() {
-        assert_eq!(tag_version("0.2.0").unwrap().0, "v0.2.0");
-        assert_eq!(tag_version("v0.2.0-rc.1").unwrap().1, Version::parse("0.2.0-rc.1").unwrap());
-        for bad in ["latest", "v1", "v1.2", "v1.2.3/../../x", "../v1.2.3", "v1.2.3?x=1", ""] {
-            assert!(tag_version(bad).is_err(), "{bad:?} must be rejected");
+        assert_eq!(release_of("0.2.0").unwrap().tag, "v0.2.0");
+        assert_eq!(release_of("v0.2.0-rc.1").unwrap().version, Version::parse("0.2.0-rc.1").unwrap());
+        for bad in ["latest", "v1", "v1.2", "v1.2.3/../../x", "../v1.2.3", "v1.2.3?x=1", "v1.2.3%2Fx", ""] {
+            assert!(release_of(bad).is_err(), "{bad:?} must be rejected");
         }
-    }
-
-    #[test]
-    fn release_lists_asset_names() {
-        let doc = serde_json::json!({ "tag_name": "v1.2.3", "assets": [{ "name": "a.tar.gz" }, { "name": CHECKSUMS }] });
-        let release = parse_release(&doc).unwrap();
-        assert_eq!((release.tag.as_str(), release.version.to_string()), ("v1.2.3", "1.2.3".to_string()));
-        assert_eq!(release.assets, ["a.tar.gz", CHECKSUMS]);
-        assert!(parse_release(&serde_json::json!({ "tag_name": "nightly" })).is_err());
-        assert!(parse_release(&serde_json::json!({})).is_err());
     }
 
     #[test]
     fn checksum_lookup_is_exact() {
         let digest = "ab".repeat(32);
         let sums = format!("{digest}  mihoctl-v1.0.0-a.tar.gz\n{} *mihoctl-v1.0.0-b.tar.gz\n", "CD".repeat(32));
-        assert_eq!(checksum_for(&sums, "mihoctl-v1.0.0-a.tar.gz").unwrap(), digest);
-        assert_eq!(checksum_for(&sums, "mihoctl-v1.0.0-b.tar.gz").unwrap(), "cd".repeat(32));
-        assert!(checksum_for(&sums, "mihoctl-v1.0.0.tar.gz").is_err());
+        assert_eq!(checksum_for(&sums, "mihoctl-v1.0.0-a.tar.gz").unwrap(), Some(digest));
+        assert_eq!(checksum_for(&sums, "mihoctl-v1.0.0-b.tar.gz").unwrap(), Some("cd".repeat(32)));
+        assert_eq!(checksum_for(&sums, "mihoctl-v1.0.0.tar.gz").unwrap(), None);
         assert!(checksum_for("abcd  x.tar.gz\n", "x.tar.gz").is_err(), "short digest");
         assert!(checksum_for(&format!("{}  x.tar.gz\n", "zz".repeat(32)), "x.tar.gz").is_err(), "non-hex digest");
     }
@@ -453,13 +477,15 @@ mod tests {
     }
 
     #[test]
-    fn update_downloads_verifies_and_installs() {
+    fn update_finds_downloads_verifies_and_installs_the_latest() {
         let dir = scratch("e2e");
         let exe = installed(&dir);
-        let github = release_server(&release_archive("9.9.9"), None);
-        let checked = update(&github, direct(), TARGET, None, true, &exe);
+        let mut routes = release_routes(&release_archive("9.9.9"), None);
+        routes.push(latest(TAG));
+        let web = serve(routes);
+        let checked = update(&web, direct(), TARGET, None, true, &exe);
         let untouched = says(&exe);
-        let installed_run = update(&github, direct(), TARGET, None, false, &exe);
+        let installed_run = update(&web, direct(), TARGET, None, false, &exe);
         let said = says(&exe);
         std::fs::remove_dir_all(&dir).ok();
         checked.unwrap();
@@ -469,11 +495,12 @@ mod tests {
     }
 
     #[test]
-    fn update_by_tag_installs_that_release() {
+    fn naming_a_version_needs_no_latest_lookup() {
         let dir = scratch("by-tag");
         let exe = installed(&dir);
-        let github = release_server(&release_archive("9.9.9"), None);
-        let result = update(&github, direct(), TARGET, Some(TAG), false, &exe);
+        // No `/releases/latest` route: asking for it would 404.
+        let web = serve(release_routes(&release_archive("9.9.9"), None));
+        let result = update(&web, direct(), TARGET, Some(TAG), false, &exe);
         let said = says(&exe);
         std::fs::remove_dir_all(&dir).ok();
         result.unwrap();
@@ -485,33 +512,37 @@ mod tests {
         let dir = scratch("tampered");
         let exe = installed(&dir);
         let name = format!("mihoctl-{TAG}-{TARGET}.tar.gz");
-        let github = release_server(&release_archive("9.9.9"), Some(format!("{}  {name}\n", "00".repeat(32))));
-        let result = update(&github, direct(), TARGET, None, false, &exe);
+        let web = serve(release_routes(&release_archive("9.9.9"), Some(format!("{}  {name}\n", "00".repeat(32)))));
+        let result = update(&web, direct(), TARGET, Some(TAG), false, &exe);
         let said = says(&exe);
         std::fs::remove_dir_all(&dir).ok();
-        assert!(format!("{:#}", result.unwrap_err()).contains("does not match"));
+        assert!(error(result).contains("does not match"));
         assert_eq!(said, "mihoctl 0.0.1");
     }
 
     #[test]
-    fn update_rejects_a_missing_platform_build() {
-        let dir = scratch("no-asset");
+    fn a_platform_missing_from_the_checksums_has_no_build() {
+        let dir = scratch("no-build");
         let exe = installed(&dir);
-        let github = release_server(&release_archive("9.9.9"), None);
-        let result = update(&github, direct(), "aarch64-apple-darwin", None, false, &exe);
+        let web = serve(release_routes(&release_archive("9.9.9"), None));
+        let result = update(&web, direct(), "aarch64-apple-darwin", Some(TAG), false, &exe);
         std::fs::remove_dir_all(&dir).ok();
-        assert!(format!("{:#}", result.unwrap_err()).contains("has no build for"));
+        assert!(error(result).contains("has no build for aarch64-apple-darwin"));
     }
 
     #[test]
-    fn up_to_date_installs_nothing() {
+    fn a_release_that_does_not_exist_is_reported() {
+        let web = serve(Vec::new());
+        let err = error(update(&web, direct(), TARGET, Some("v8.8.8"), true, Path::new("/nonexistent/mihoctl")));
+        assert!(err.contains("release v8.8.8 does not exist"), "{err}");
+    }
+
+    #[test]
+    fn up_to_date_installs_nothing_and_downloads_nothing() {
         let dir = scratch("current");
         let exe = installed(&dir);
-        let own = env!("CARGO_PKG_VERSION");
-        let doc = serde_json::json!({ "tag_name": format!("v{own}"), "assets": [] });
-        let base = serve(vec![(format!("/repos/{REPO}/releases/latest"), doc.to_string().into_bytes())]);
-        let github = Github { api: base.clone(), web: base };
-        let result = update(&github, direct(), TARGET, None, false, &exe);
+        let web = serve(vec![latest(&format!("v{}", env!("CARGO_PKG_VERSION")))]);
+        let result = update(&web, direct(), TARGET, None, false, &exe);
         let said = says(&exe);
         std::fs::remove_dir_all(&dir).ok();
         result.unwrap();
@@ -519,20 +550,54 @@ mod tests {
     }
 
     #[test]
-    fn unknown_release_is_a_github_answer_not_a_transport_failure() {
-        let github = Github { api: serve(Vec::new()), web: String::new() };
-        // Two routes: a 404 must end the lookup instead of retrying on the second one.
-        let err = lookup(&github, vec![("first", None), ("second", None)], Some(TAG)).err().unwrap();
-        let msg = format!("{err:#}");
-        assert!(msg.contains("does not exist") && !msg.contains("second"), "{msg}");
+    fn no_published_release_is_reported() {
+        // GitHub redirects to the bare release list while a repository has none.
+        let web = serve(vec![(format!("/{REPO}/releases/latest"), redirect(&format!("https://github.com/{REPO}/releases")))]);
+        let err = error(update(&web, direct(), TARGET, None, true, Path::new("/nonexistent/mihoctl")));
+        assert!(err.contains("no release has been published yet"), "{err}");
     }
 
     #[test]
-    fn unreachable_routes_are_all_reported() {
-        let dead = TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap();
-        let github = Github { api: format!("http://{dead}"), web: String::new() };
-        let err = lookup(&github, vec![("first", None), ("second", None)], None).err().unwrap();
-        let msg = format!("{err:#}");
-        assert!(msg.contains("first:") && msg.contains("second:"), "{msg}");
+    fn a_redirect_to_something_that_is_not_a_version_is_refused() {
+        for tag in ["v1.0.0/../../x", "latest", "v1.0.0%2F..%2Fx"] {
+            let web = serve(vec![latest(tag)]);
+            let err = error(update(&web, direct(), TARGET, None, true, Path::new("/nonexistent/mihoctl")));
+            assert!(err.contains("is not a release version"), "{tag}: {err}");
+        }
+    }
+
+    #[test]
+    fn rate_limiting_is_named_as_such() {
+        let web = serve(vec![(format!("/{REPO}/releases/latest"), refuse("429 Too Many Requests"))]);
+        let err = error(update(&web, direct(), TARGET, None, true, Path::new("/nonexistent/mihoctl")));
+        assert!(err.contains("limiting requests"), "{err}");
+    }
+
+    #[test]
+    fn an_unreachable_route_falls_through_to_the_next() {
+        let dir = scratch("fallback");
+        let exe = installed(&dir);
+        let mut routes = release_routes(&release_archive("9.9.9"), None);
+        routes.push(latest(TAG));
+        let web = serve(routes);
+        let result = update(&web, vec![dead("via core"), ("direct", None)], TARGET, None, false, &exe);
+        let said = says(&exe);
+        std::fs::remove_dir_all(&dir).ok();
+        result.unwrap();
+        assert_eq!(said, "mihoctl 9.9.9");
+    }
+
+    #[test]
+    fn an_answer_from_github_is_final_even_with_routes_left() {
+        let web = serve(Vec::new());
+        let err = error(update(&web, vec![("direct", None), dead("second")], TARGET, Some(TAG), true, Path::new("/nonexistent/mihoctl")));
+        assert!(err.contains("does not exist") && !err.contains("second"), "{err}");
+    }
+
+    #[test]
+    fn every_unreachable_route_is_reported() {
+        let web = serve(Vec::new());
+        let err = error(update(&web, vec![dead("first"), dead("second")], TARGET, None, true, Path::new("/nonexistent/mihoctl")));
+        assert!(err.contains("could not reach GitHub") && err.contains("first:") && err.contains("second:"), "{err}");
     }
 }
