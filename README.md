@@ -31,6 +31,31 @@ The geodata files (`GEOSITE.dat`, `geoip.metadb`, `ASN.mmdb`) are needed in `cor
 
 **Upgrading from the old layout** (core ran with `-d <core_dir>`): run `mihoctl apply` to rebuild with inline providers, then `mihoctl service install`. Install refuses a stale `config.yaml`. The old core left root-owned files behind, which you can remove: `sudo rm -rf "<core_dir>/cache.db" "<core_dir>/ui" ~/Library/Logs/mihoctl/core.log`.
 
+### Shell completion
+
+Add the line for your shell to its startup file, then open a new shell. Generating the
+registration at startup keeps it in sync with the installed `mihoctl` after upgrades.
+
+| Shell | Startup file | Registration |
+|---|---|---|
+| Bash | `~/.bashrc` | `eval "$(MIHOCTL_COMPLETE=bash mihoctl)"` |
+| Fish | `~/.config/fish/config.fish` | `MIHOCTL_COMPLETE=fish mihoctl \| source` |
+| Zsh | `~/.zshrc` (after `compinit`) | `source <(MIHOCTL_COMPLETE=zsh mihoctl)` |
+| Elvish | `~/.elvish/rc.elv` | `eval (E:MIHOCTL_COMPLETE=elvish mihoctl \| slurp)` |
+
+Bash login shells can load `~/.bashrc` from `~/.bash_profile`.
+Add the following to `$PROFILE` for PowerShell.
+
+```powershell
+$env:MIHOCTL_COMPLETE = 'powershell'
+try { mihoctl | Out-String | Invoke-Expression } finally { Remove-Item Env:MIHOCTL_COMPLETE }
+```
+
+Tab completion offers subscription names for `update`, `history`, and `restore`.
+It reads the local settings on each request, using `--config` if supplied, then
+`MIHOCTL_CONFIG`, then the platform default. Changes to the subscription list take
+effect on the next completion.
+
 ## mihoctl.toml
 
 ```toml

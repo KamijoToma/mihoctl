@@ -12,7 +12,8 @@ mod status;
 mod subscription;
 mod tailscale;
 use anyhow::{Context, Result, bail};
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand, ValueHint};
+use clap_complete::{ArgValueCandidates, CompleteEnv, CompletionCandidate};
 use pipeline::Applied;
 use settings::{Paths, Settings};
 use state::State;
@@ -23,7 +24,7 @@ use std::path::PathBuf;
 #[command(version)]
 struct Cli {
     /// Settings file (default: $MIHOCTL_CONFIG or ~/.config/mihoctl/mihoctl.toml)
-    #[arg(short, long, global = true)]
+    #[arg(short, long, global = true, value_hint = ValueHint::FilePath)]
     config: Option<PathBuf>,
     #[command(subcommand)]
     cmd: Cmd,
@@ -33,18 +34,26 @@ struct Cli {
 enum Cmd {
     /// Download subscriptions into the node cache (all, or the named ones)
     Update {
+        #[arg(add = ArgValueCandidates::new(subscription_candidates))]
         names: Vec<String>,
         /// Proxy for downloads instead of the running core's mixed port, e.g. http://127.0.0.1:7897
         #[arg(long)]
         proxy: Option<String>,
     },
     /// List retained node versions (not historical runtime configurations)
-    History { subscription: Option<String> },
+    History {
+        #[arg(add = ArgValueCandidates::new(subscription_candidates))]
+        subscription: Option<String>,
+    },
     /// Restore one subscription's nodes using the current template and overrides
-    Restore { subscription: String, version: Option<String> },
+    Restore {
+        #[arg(add = ArgValueCandidates::new(subscription_candidates))]
+        subscription: String,
+        version: Option<String>,
+    },
     /// Generate and validate the config; print it, or write it to a file
     Build {
-        #[arg(short, long)]
+        #[arg(short, long, value_hint = ValueHint::FilePath)]
         output: Option<PathBuf>,
     },
     /// Build, validate, install and hot-reload; roll back if the health check fails
@@ -108,18 +117,47 @@ enum ServiceAction {
 }
 
 fn main() {
+    let completion_env = "MIHOCTL_COMPLETE";
+    if std::env::var_os(completion_env).is_some() {
+        CompleteEnv::with_factory(Cli::command).var(completion_env).complete();
+    }
     if let Err(err) = run() {
         eprintln!("error: {err:#}");
         std::process::exit(1);
     }
 }
 
+fn subscription_candidates() -> Vec<CompletionCandidate> {
+    // CompleteEnv forwards the command line after its own `--` separator. Parse it with
+    // the same global options as a normal invocation, even while the line is incomplete.
+    let words = std::env::args_os().skip(1).skip_while(|arg| arg != "--").skip(1);
+    let explicit = Cli::command()
+        .ignore_errors(true)
+        .try_get_matches_from(words)
+        .ok()
+        .and_then(|mut matches| matches.remove_one::<PathBuf>("config"));
+    let settings = explicit.map(completion_config_path).map_or_else(settings::default_settings_file, Ok)
+        .and_then(|file| settings::load(&file));
+    let Ok((settings, _)) = settings else { return Vec::new() };
+    settings.subscriptions.into_iter().map(|sub| CompletionCandidate::new(sub.name)).collect()
+}
+
+fn completion_config_path(file: PathBuf) -> PathBuf {
+    // Bash and Zsh can forward the shell's quoting. Other shells may already have removed it.
+    if let Some(path) = file.to_str()
+        && path.contains(['\'', '"', '\\'])
+        && !file.exists()
+        && let Some(mut words) = shlex::split(path)
+        && words.len() == 1
+    {
+        return words.swap_remove(0).into();
+    }
+    file
+}
+
 fn run() -> Result<()> {
     let cli = Cli::parse();
-    let file = match cli.config {
-        Some(p) => p,
-        None => settings::default_settings_file()?,
-    };
+    let file = cli.config.map_or_else(settings::default_settings_file, Ok)?;
     // Needs no valid settings (a broken config is a reason to update), only a proxy hint from them.
     if let Cmd::SelfUpdate { check, version, proxy } = &cli.cmd {
         let core_proxy = settings::load(&file).ok().and_then(|(settings, _)| core_mixed_proxy(&settings));
